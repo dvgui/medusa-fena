@@ -157,13 +157,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     : undefined,
                 customerEmail: context?.customer?.email ?? undefined,
                 customRedirectUrl: this.options_.redirectUrl
-                    ? this.options_.redirectUrl
-                        .replace("{cart_id}", sessionId)
-                        .replace(
-                            "{country_code}",
-                            // @ts-ignore - Default to region specific identifier if passed in from Storefront SDK context
-                            (context?.region?.id || context?.billing_address?.country_code || context?.shipping_address?.country_code || currency_code.substring(0, 2)).toLowerCase()
-                        )
+                    ? this.options_.redirectUrl.replace("{cart_id}", sessionId)
                     : undefined,
                 description: `Order payment — ${currency_code.toUpperCase()}`,
             })
