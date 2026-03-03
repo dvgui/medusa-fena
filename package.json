@@ -16,9 +16,7 @@
     "scripts"
   ],
   "exports": {
-    ".": "./.medusa/server/src/index.js",
     "./package.json": "./package.json",
-    "./api/*": "./.medusa/server/src/api/*/route.js",
     "./providers/*": "./.medusa/server/src/providers/*/index.js",
     "./*": "./.medusa/server/src/*.js"
   },
