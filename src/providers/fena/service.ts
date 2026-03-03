@@ -161,8 +161,8 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         .replace("{cart_id}", sessionId)
                         .replace(
                             "{country_code}",
-                            // @ts-ignore - Check for country code deeply in context, or fallback to currency slice (e.g. gbp -> gb)
-                            (context?.billing_address?.country_code || context?.shipping_address?.country_code || currency_code.substring(0, 2)).toLowerCase()
+                            // @ts-ignore - Default to region specific identifier if passed in from Storefront SDK context
+                            (context?.region?.id || context?.billing_address?.country_code || context?.shipping_address?.country_code || currency_code.substring(0, 2)).toLowerCase()
                         )
                     : undefined,
                 description: `Order payment — ${currency_code.toUpperCase()}`,
