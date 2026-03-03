@@ -84,10 +84,10 @@ When this ID is passed, Fena automatically transitions the payment session into 
 
 ## Webhook Setup
 
-The plugin exposes a webhook endpoint at:
+The plugin relies on Medusa v2's native webhook routing engine at:
 
 ```
-POST https://your-medusa-backend.com/fena/webhooks
+POST https://your-medusa-backend.com/hooks/payment/fena_fena-ob
 ```
 
 Configure this URL in your [Fena Dashboard](https://dashboard.fena.co) under your API key's webhook settings.
