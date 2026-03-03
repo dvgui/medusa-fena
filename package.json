@@ -12,7 +12,11 @@
     "registry": "https://npm.pkg.github.com"
   },
   "files": [
-    ".medusa/server"
+    ".medusa/server",
+    "src",
+    "scripts",
+    "tsconfig.json",
+    "tsconfig.server.json"
   ],
   "exports": {
     "./package.json": "./package.json",
