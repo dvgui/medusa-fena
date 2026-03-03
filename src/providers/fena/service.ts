@@ -157,7 +157,12 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     : undefined,
                 customerEmail: context?.customer?.email ?? undefined,
                 customRedirectUrl: this.options_.redirectUrl
-                    ? this.options_.redirectUrl.replace("{cart_id}", sessionId)
+                    ? `${this.options_.redirectUrl.replace("{cart_id}", sessionId)}?country_code=${(
+                        (context as any)?.region?.id ||
+                        (context as any)?.billing_address?.country_code ||
+                        (context as any)?.shipping_address?.country_code ||
+                        currency_code.substring(0, 2)
+                    ).toLowerCase()}`
                     : undefined,
                 description: `Order payment — ${currency_code.toUpperCase()}`,
             })
