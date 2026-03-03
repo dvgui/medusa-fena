@@ -1,9 +1,16 @@
 {
-  "name": "fena-plugin",
+  "name": "@baam25/fena-plugin",
   "version": "0.0.1",
-  "description": "A starter for Medusa plugins.",
-  "author": "Medusa (https://medusajs.com)",
+  "description": "Fena Open Banking Payment Provider for MedusaJS v2.",
+  "author": "Baam25",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Baam25/medusa-fena-plugin.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "files": [
     ".medusa/server"
   ],
