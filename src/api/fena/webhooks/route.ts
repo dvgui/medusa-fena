@@ -24,7 +24,7 @@ export async function POST(
         const paymentModuleService = req.scope.resolve("payment")
 
         const result = await paymentModuleService.getWebhookActionAndData({
-            provider: "pp_fena_ob",
+            provider: "pp_fena_fena-ob",
             payload: {
                 data: req.body as Record<string, unknown>,
                 rawData: JSON.stringify(req.body),

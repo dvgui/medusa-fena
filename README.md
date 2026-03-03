@@ -38,7 +38,6 @@ export default defineConfig({
               terminalId: process.env.FENA_TERMINAL_ID!,
               terminalSecret: process.env.FENA_TERMINAL_SECRET!,
               bankAccountId: process.env.FENA_BANK_ACCOUNT_ID,   // optional — uses default if omitted
-              sandbox: process.env.FENA_SANDBOX === "true",       // optional — defaults to false
               redirectUrl: process.env.FENA_REDIRECT_URL,         // optional — overrides Fena dashboard setting
             },
           },
@@ -56,7 +55,6 @@ export default defineConfig({
 | `FENA_TERMINAL_ID` | ✅ | Integration ID from [Fena Dashboard](https://dashboard.fena.co) → API Keys |
 | `FENA_TERMINAL_SECRET` | ✅ | Integration Secret (UUID format) |
 | `FENA_BANK_ACCOUNT_ID` | ❌ | Specific bank account ID. Uses your default if omitted. |
-| `FENA_SANDBOX` | ❌ | Set to `"true"` for sandbox mode |
 | `FENA_REDIRECT_URL` | ❌ | Where to redirect customers after payment |
 
 ## Enable in Admin
@@ -64,6 +62,25 @@ export default defineConfig({
 1. Go to your Medusa Admin → **Settings** → **Regions**
 2. Select a region
 3. Add **pp_fena_ob** as a payment provider
+
+## Sandbox Testing
+
+Fena does not provide separate sandbox API credentials. To test simulated payments without real money, you must use your production `terminalId` and `terminalSecret`, but override the destination account to your hidden Sandbox Bank ID.
+
+### How to get your Sandbox Bank ID:
+Your Sandbox Bank ID is generated automatically by Fena but is hidden from their UI dashboard. We have included a helper script to fetch it for you.
+
+To find your ID, run:
+```bash
+node node_modules/fena-plugin/scripts/get-sandbox-id.js
+```
+*(Make sure `FENA_TERMINAL_ID` and `FENA_TERMINAL_SECRET` are already defined in your `.env` file!)*
+
+Set the ID it gives you in your backend `.env` file:
+```env
+FENA_BANK_ACCOUNT_ID=69550ec05... # Your Sandbox Bank ID
+```
+When this ID is passed, Fena automatically transitions the payment session into simulation mode. Options like **NatWest Sandbox** and **TSB Sandbox** will appear on the payment screen.
 
 ## Webhook Setup
 
@@ -309,10 +326,10 @@ export async function GET(req: NextRequest, { params }: { params: Params }) {
 Then set your redirect URL to point to this route:
 
 ```env
-FENA_REDIRECT_URL=https://your-storefront.com/api/fena-callback/{cart_id}?country_code=gb
+FENA_REDIRECT_URL=https://your-storefront.com/{country_code}/api/fena-callback/{cart_id}
 ```
 
-> **Note:** Replace `{cart_id}` with the actual cart ID in your `initiatePayment` flow, or pass it as part of the Fena payment reference.
+> **Note:** Replace `{cart_id}` or `{country_code}` dynamically in the URL! The plugin will automatically parse and inject the matching IDs.
 
 ### Step 5: QR Code Display (Optional)
 

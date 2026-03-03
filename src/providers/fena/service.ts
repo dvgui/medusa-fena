@@ -62,8 +62,6 @@ export type FenaPaymentProviderOptions = {
     bankAccountId?: string
     /** Payment method — defaults to fena_ob (redirect) */
     paymentMethod?: FenaPaymentMethod
-    /** Whether to use sandbox mode */
-    sandbox?: boolean
     /** Custom redirect URL after payment. Overrides the Fena dashboard setting. */
     redirectUrl?: string
     /** Webhook URL for Fena to send payment status updates */
@@ -95,7 +93,7 @@ function getDataString(
 // Provider identifier
 // ────────────────────────────────────────────────────────
 
-export const FENA_PROVIDER_ID = "pp_fena_ob"
+export const FENA_PROVIDER_ID = "fena"
 
 // ────────────────────────────────────────────────────────
 // Provider Service
@@ -121,7 +119,6 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         this.client_ = new FenaClient({
             terminalId: options.terminalId,
             terminalSecret: options.terminalSecret,
-            sandbox: options.sandbox,
         })
 
         this.logger_.info("Fena Payment Provider initialized")
@@ -142,20 +139,32 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         const { amount, currency_code, context } = input
 
         try {
-            // Generate a unique reference for this payment session
-            const sessionId = getDataString(input.data, "session_id") ?? `${Date.now()}`
-            const reference = `medusa-${sessionId}`
+            // Fena strictly requires a max 12-char alphanumeric reference
+            const sessionId = getDataString(input.data, "session_id") ?? `cart_${Date.now()}`
+            const reference = sessionId.slice(-12)
+
+            // Fena strictly requires the format "/^[0-9]*\.[0-9]{2}$/" 
+            // Medusa v2 amounts are exact (20 = €20.00), not in cents.
+            const formattedAmount = Number(amount).toFixed(2)
 
             const response = await this.client_.createAndProcessPayment({
                 reference,
-                amount: amount.toString(),
+                amount: formattedAmount,
                 bankAccount: this.options_.bankAccountId,
                 paymentMethod: this.options_.paymentMethod || FenaPaymentMethod.FenaOB,
                 customerName: context?.customer?.first_name
                     ? `${context.customer.first_name} ${context.customer.last_name || ""}`.trim()
                     : undefined,
                 customerEmail: context?.customer?.email ?? undefined,
-                customRedirectUrl: this.options_.redirectUrl,
+                customRedirectUrl: this.options_.redirectUrl
+                    ? this.options_.redirectUrl
+                        .replace("{cart_id}", sessionId)
+                        .replace(
+                            "{country_code}",
+                            // @ts-ignore - Check for country code deeply in context, or fallback to currency slice (e.g. gbp -> gb)
+                            (context?.billing_address?.country_code || context?.shipping_address?.country_code || currency_code.substring(0, 2)).toLowerCase()
+                        )
+                    : undefined,
                 description: `Order payment — ${currency_code.toUpperCase()}`,
             })
 

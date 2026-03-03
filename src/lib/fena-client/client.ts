@@ -48,15 +48,12 @@ export class FenaClient {
     private readonly baseUrl: string
 
     constructor(config: FenaClientConfig) {
-        if (!config.terminalId) {
-            throw new Error("Fena: terminalId is required")
-        }
-        if (!config.terminalSecret) {
-            throw new Error("Fena: terminalSecret is required")
+        if (!config.terminalId || !config.terminalSecret) {
+            console.warn("Fena Provider Warning: terminalId and/or terminalSecret are missing. Payments will fail if attempted.")
         }
 
-        this.terminalId = config.terminalId
-        this.terminalSecret = config.terminalSecret
+        this.terminalId = config.terminalId || "test_terminal_id"
+        this.terminalSecret = config.terminalSecret || "test_terminal_secret"
         this.baseUrl = config.baseUrl || FENA_DEFAULT_BASE_URL
     }
 
@@ -76,8 +73,9 @@ export class FenaClient {
             method,
             headers: {
                 "Content-Type": "application/json",
-                "terminal-id": this.terminalId,
-                "terminal-secret": this.terminalSecret,
+                // Fena API expects these exact header names, despite what the dashboard calls them:
+                "integration-id": this.terminalId,
+                "secret-key": this.terminalSecret,
             },
         }
 
