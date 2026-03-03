@@ -147,6 +147,21 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             // Medusa v2 amounts are exact (20 = €20.00), not in cents.
             const formattedAmount = Number(amount).toFixed(2)
 
+            // Log full context to understand what Medusa sends
+            this.logger_.info(
+                `Fena: initiatePayment context — ${JSON.stringify(context, null, 2)}`
+            )
+            this.logger_.info(
+                `Fena: initiatePayment input.data — ${JSON.stringify(input.data, null, 2)}`
+            )
+
+            // Extract country code from PaymentProviderContext
+            // context.customer.billing_address.country_code is the correct path
+            const countryCode = (
+                (context?.customer?.billing_address as any)?.country_code ||
+                "gb"
+            ).toLowerCase()
+
             const response = await this.client_.createAndProcessPayment({
                 reference,
                 amount: formattedAmount,
@@ -157,11 +172,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     : undefined,
                 customerEmail: context?.customer?.email ?? undefined,
                 customRedirectUrl: this.options_.redirectUrl
-                    ? `${this.options_.redirectUrl.replace("{cart_id}", sessionId)}?country_code=${(
-                        (context as any)?.billing_address?.country_code ||
-                        (context as any)?.shipping_address?.country_code ||
-                        currency_code.substring(0, 2)
-                    ).toLowerCase()}`
+                    ? `${this.options_.redirectUrl.replace("{cart_id}", sessionId)}?country_code=${countryCode}`
                     : undefined,
                 description: `Order payment — ${currency_code.toUpperCase()}`,
             })
@@ -169,7 +180,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const payment = response.result
 
             this.logger_.info(
-                `Fena: Payment created — ID: ${payment.id}, Link: ${payment.link}`
+                `Fena: Payment created — ID: ${payment.id}, Link: ${payment.link}, Country: ${countryCode}`
             )
 
             return {
