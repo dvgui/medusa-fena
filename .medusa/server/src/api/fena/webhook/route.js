@@ -8,7 +8,7 @@
  * through Medusa's payment module.
  *
  * Configure this URL in your Fena dashboard as the webhook endpoint:
- *   https://your-medusa-backend.com/fena/webhooks
+ *   https://your-medusa-backend.com/fena/webhook
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.POST = POST;
