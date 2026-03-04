@@ -139,13 +139,13 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         const { amount, currency_code, context } = input
 
         try {
-            // Fena reference field supports up to 255 chars.
-            // Store the full Medusa session ID so Fena echoes it back in the webhook,
-            // allowing processPaymentWorkflow to correctly find and authorize the session.
+            // Fena requires max 12-char alphanumeric reference.
+            // We keep the truncated reference for Fena, but embed the full Medusa session ID
+            // in the description field (no length limit) so we can recover it during webhook.
             const sessionId = getDataString(input.data, "session_id") ?? `cart_${Date.now()}`
-            const reference = sessionId  // Full session ID, not truncated
+            const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
 
-            // Fena strictly requires the format "/^[0-9]*\.[0-9]{2}$/" 
+            // Fena strictly requires the format "/^[0-9]*\.[0-9]{2}$/"
             // Medusa v2 amounts are exact (20 = €20.00), not in cents.
             const formattedAmount = Number(amount).toFixed(2)
 
@@ -158,13 +158,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     ? `${context.customer.first_name} ${context.customer.last_name || ""}`.trim()
                     : undefined,
                 customerEmail: context?.customer?.email ?? undefined,
-                // Replace {cart_id} with sessionId for the redirect URL
-                // Note: sessionId is the payment session ID (payses_...), not the actual cart ID
-                // The storefront callback uses cookie-based cart retrieval instead
                 customRedirectUrl: this.options_.redirectUrl
                     ? this.options_.redirectUrl.replace("{cart_id}", sessionId)
                     : undefined,
-                description: `Order payment — ${currency_code.toUpperCase()}`,
+                // Embed full Medusa session ID in description so we can recover it in webhooks
+                description: `[medusa_session:${sessionId}] Order payment — ${currency_code.toUpperCase()}`,
             })
 
             const payment = response.result
@@ -472,9 +470,26 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 `Fena webhook: Payment ${fenaPaymentId} — status: ${fenaStatus}, ref: ${reference}`
             )
 
-            // `reference` is the full Medusa payment session ID (payses_...) stored
-            // during initiatePayment. Use it directly as session_id.
-            const sessionId = reference || ""
+            // The reference is only 12 chars (truncated). We need the full Medusa session ID.
+            // We encoded it in the payment description as: [medusa_session:payses_...]
+            // Call Fena API to get the full payment details and extract the session ID.
+            let sessionId = ""
+
+            try {
+                const payment = await this.client_.getPayment(fenaPaymentId)
+                const descMatch = payment.description?.match(/\[medusa_session:([^\]]+)\]/)
+                if (descMatch) {
+                    sessionId = descMatch[1]
+                    this.logger_.info(`Fena webhook: recovered session_id from description: ${sessionId}`)
+                } else {
+                    // Fallback: use reference (will likely fail but log it for debugging)
+                    sessionId = reference || ""
+                    this.logger_.warn(`Fena webhook: no session_id in description, using reference: ${sessionId}`)
+                }
+            } catch (err: any) {
+                sessionId = reference || ""
+                this.logger_.error(`Fena webhook: failed to fetch payment for session recovery: ${err.message}`)
+            }
 
             this.logger_.info(`Fena webhook: resolved session_id: ${sessionId}`)
 
