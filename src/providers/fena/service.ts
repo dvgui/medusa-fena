@@ -464,19 +464,23 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 }
             }
 
-            const { id: fenaPaymentId, status: fenaStatus, amount, reference } = webhookData
+            const { id: fenaPaymentId, status: webhookStatus, amount, reference } = webhookData
 
             this.logger_.info(
-                `Fena webhook: Payment ${fenaPaymentId} — status: ${fenaStatus}, ref: ${reference}`
+                `Fena webhook: Payment ${fenaPaymentId} — status: ${webhookStatus}, ref: ${reference}`
             )
 
             // The reference is only 12 chars (truncated). We need the full Medusa session ID.
             // We encoded it in the payment description as: [medusa_session:payses_...]
             // Call Fena API to get the full payment details and extract the session ID.
             let sessionId = ""
+            // Use the authentic status from the API instead of trusting the webhook payload
+            let authenticStatus = webhookStatus
 
             try {
                 const payment = await this.client_.getPayment(fenaPaymentId)
+                authenticStatus = payment.status
+
                 const descMatch = payment.description?.match(/\[medusa_session:([^\]]+)\]/)
                 if (descMatch) {
                     sessionId = descMatch[1]
@@ -491,15 +495,15 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 this.logger_.error(`Fena webhook: failed to fetch payment for session recovery: ${err.message}`)
             }
 
-            this.logger_.info(`Fena webhook: resolved session_id: ${sessionId}`)
+            this.logger_.info(`Fena webhook: resolved session_id: ${sessionId}, authentic_status: ${authenticStatus}`)
 
             const payloadData = {
                 session_id: sessionId,
                 amount: new BigNumber(amount || 0),
             }
 
-            // Map Fena payment statuses to Medusa payment actions
-            switch (fenaStatus) {
+            // Map authentic Fena payment status to Medusa payment actions
+            switch (authenticStatus) {
                 case FenaPaymentStatus.Paid:
                     return {
                         action: PaymentActions.SUCCESSFUL,
@@ -540,7 +544,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
                 default:
                     this.logger_.info(
-                        `Fena webhook: Unhandled status "${fenaStatus}" for payment ${fenaPaymentId}`
+                        `Fena webhook: Unhandled status "${authenticStatus}" for payment ${fenaPaymentId}`
                     )
                     return {
                         action: PaymentActions.NOT_SUPPORTED,
