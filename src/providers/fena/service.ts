@@ -93,7 +93,7 @@ function getDataString(
 // Provider identifier
 // ────────────────────────────────────────────────────────
 
-export const FENA_PROVIDER_ID = "fena"
+export const FENA_PROVIDER_ID = "fena-ob"
 
 // ────────────────────────────────────────────────────────
 // Provider Service
