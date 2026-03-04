@@ -136,8 +136,8 @@ export class FenaClient {
      * `GET /open/payments/single/{id}`
      */
     async getPayment(id: string): Promise<FenaPayment> {
-        const res = await this.request<{ result: FenaPayment }>("GET", `/open/payments/single/${id}`)
-        return res.result
+        const res = await this.request<FenaPayment>("GET", `/open/payments/single/${id}`)
+        return res
     }
 
     /**
