@@ -147,21 +147,6 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             // Medusa v2 amounts are exact (20 = €20.00), not in cents.
             const formattedAmount = Number(amount).toFixed(2)
 
-            // Log full context to understand what Medusa sends
-            this.logger_.info(
-                `Fena: initiatePayment context — ${JSON.stringify(context, null, 2)}`
-            )
-            this.logger_.info(
-                `Fena: initiatePayment input.data — ${JSON.stringify(input.data, null, 2)}`
-            )
-
-            // Extract country code from PaymentProviderContext
-            // context.customer.billing_address.country_code is the correct path
-            const countryCode = (
-                (context?.customer?.billing_address as any)?.country_code ||
-                "gb"
-            ).toLowerCase()
-
             const response = await this.client_.createAndProcessPayment({
                 reference,
                 amount: formattedAmount,
@@ -171,8 +156,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     ? `${context.customer.first_name} ${context.customer.last_name || ""}`.trim()
                     : undefined,
                 customerEmail: context?.customer?.email ?? undefined,
+                // Replace {cart_id} with sessionId for the redirect URL
+                // Note: sessionId is the payment session ID (payses_...), not the actual cart ID
+                // The storefront callback uses cookie-based cart retrieval instead
                 customRedirectUrl: this.options_.redirectUrl
-                    ? `${this.options_.redirectUrl.replace("{cart_id}", sessionId)}?country_code=${countryCode}`
+                    ? this.options_.redirectUrl.replace("{cart_id}", sessionId)
                     : undefined,
                 description: `Order payment — ${currency_code.toUpperCase()}`,
             })
@@ -180,7 +168,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const payment = response.result
 
             this.logger_.info(
-                `Fena: Payment created — ID: ${payment.id}, Link: ${payment.link}, Country: ${countryCode}`
+                `Fena: Payment created — ID: ${payment.id}, Link: ${payment.link}`
             )
 
             return {
