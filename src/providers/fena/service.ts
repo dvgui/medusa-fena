@@ -139,9 +139,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         const { amount, currency_code, context } = input
 
         try {
-            // Fena strictly requires a max 12-char alphanumeric reference
+            // Fena reference field supports up to 255 chars.
+            // Store the full Medusa session ID so Fena echoes it back in the webhook,
+            // allowing processPaymentWorkflow to correctly find and authorize the session.
             const sessionId = getDataString(input.data, "session_id") ?? `cart_${Date.now()}`
-            const reference = sessionId.slice(-12)
+            const reference = sessionId  // Full session ID, not truncated
 
             // Fena strictly requires the format "/^[0-9]*\.[0-9]{2}$/" 
             // Medusa v2 amounts are exact (20 = €20.00), not in cents.
@@ -470,16 +472,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 `Fena webhook: Payment ${fenaPaymentId} — status: ${fenaStatus}, ref: ${reference}`
             )
 
-            // Look up the full payment to get the session_id
-            let sessionId = reference || ""
+            // `reference` is the full Medusa payment session ID (payses_...) stored
+            // during initiatePayment. Use it directly as session_id.
+            const sessionId = reference || ""
 
-            // Try to get updated payment data from Fena for accuracy
-            try {
-                const payment = await this.client_.getPayment(fenaPaymentId)
-                sessionId = payment.reference || sessionId
-            } catch {
-                // Continue with webhook data if API lookup fails
-            }
+            this.logger_.info(`Fena webhook: resolved session_id: ${sessionId}`)
 
             const payloadData = {
                 session_id: sessionId,
