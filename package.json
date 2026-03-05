@@ -53,13 +53,24 @@
     "yalc": "^1.0.0-pre.53"
   },
   "peerDependencies": {
-    "@medusajs/admin-sdk": "2.13.1",
     "@medusajs/cli": "2.13.1",
     "@medusajs/framework": "2.13.1",
     "@medusajs/test-utils": "2.13.1",
     "@medusajs/medusa": "2.13.1",
+    "@medusajs/admin-sdk": "2.13.1",
     "@medusajs/ui": "4.0.25",
     "@medusajs/icons": "2.13.1"
+  },
+  "peerDependenciesMeta": {
+    "@medusajs/admin-sdk": {
+      "optional": true
+    },
+    "@medusajs/ui": {
+      "optional": true
+    },
+    "@medusajs/icons": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=20"
