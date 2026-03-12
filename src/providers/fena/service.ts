@@ -722,9 +722,18 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         }
 
         try {
+            const address = context.customer?.billing_address
+            
             const managedEntity = await this.client_.createManagedEntity({
                 name: `${customer.first_name} ${customer.last_name || ""}`.trim() || customer.email,
                 type: FenaManagedEntityType.Consumer,
+                countryCode: address?.country_code?.toUpperCase() || "GB",
+                address: address ? {
+                    addressLine1: address.address_1 || "Unknown",
+                    city: address.city || "Unknown",
+                    zipCode: address.postal_code || "Unknown",
+                    country: address.country_code?.toUpperCase() || "GB"
+                } : undefined
             })
 
             return {

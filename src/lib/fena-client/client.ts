@@ -169,7 +169,7 @@ export class FenaClient {
      * `POST /payments/recurring/create`
      */
     async createDraftRecurringPayment(input: CreateRecurringPaymentInput): Promise<FenaCreateRecurringPaymentResponse> {
-        return this.request("POST", "/payments/recurring/create", input)
+        return this.request("POST", "/open/payments/recurring/create", input)
     }
 
     /**
@@ -178,7 +178,7 @@ export class FenaClient {
      * `POST /payments/recurring/create-and-process`
      */
     async createAndProcessRecurringPayment(input: CreateRecurringPaymentInput): Promise<FenaCreateRecurringPaymentResponse> {
-        return this.request("POST", "/payments/recurring/create-and-process", input)
+        return this.request("POST", "/open/payments/recurring/create-and-process", input)
     }
 
     /**
@@ -187,7 +187,7 @@ export class FenaClient {
      * `GET /payments/recurring/{id}`
      */
     async getRecurringPayment(id: string): Promise<FenaRecurringPayment> {
-        const res = await this.request<{ data: FenaRecurringPayment }>("GET", `/payments/recurring/${id}`)
+        const res = await this.request<{ data: FenaRecurringPayment }>("GET", `/open/payments/recurring/${id}`)
         return res.data
     }
 
@@ -197,7 +197,7 @@ export class FenaClient {
      * `POST /payments/recurring/{id}/process`
      */
     async processRecurringPayment(id: string): Promise<FenaRecurringPaymentWithLink> {
-        const res = await this.request<{ result: FenaRecurringPaymentWithLink }>("POST", `/payments/recurring/${id}/process`)
+        const res = await this.request<{ result: FenaRecurringPaymentWithLink }>("POST", `/open/payments/recurring/${id}/process`)
         return res.result
     }
 
@@ -207,7 +207,7 @@ export class FenaClient {
      * `POST /payments/recurring/{id}/delete`
      */
     async deleteRecurringPayment(id: string): Promise<boolean> {
-        const res = await this.request<{ deleted: boolean }>("POST", `/payments/recurring/${id}/delete`)
+        const res = await this.request<{ deleted: boolean }>("POST", `/open/payments/recurring/${id}/delete`)
         return res.deleted
     }
 
@@ -222,7 +222,7 @@ export class FenaClient {
      * `POST /companies/info/create`
      */
     async createManagedEntity(input: FenaManagedEntityInput): Promise<FenaManagedEntity> {
-        const res = await this.request<{ data: FenaManagedEntity }>("POST", "/companies/info/create", input)
+        const res = await this.request<{ data: FenaManagedEntity }>("POST", "/open/partner/companies/info/create", input)
         return res.data
     }
 
@@ -232,7 +232,7 @@ export class FenaClient {
      * `GET /companies/info/{id}`
      */
     async getManagedEntity(id: string): Promise<FenaManagedEntity> {
-        const res = await this.request<{ data: FenaManagedEntity }>("GET", `/companies/info/${id}`)
+        const res = await this.request<{ data: FenaManagedEntity }>("GET", `/open/partner/companies/info/${id}`)
         return res.data
     }
 
