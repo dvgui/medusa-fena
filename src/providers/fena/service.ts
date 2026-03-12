@@ -40,13 +40,24 @@ import type {
     ProviderWebhookPayload,
     WebhookActionResult,
     PaymentSessionStatus,
+    CreateAccountHolderInput,
+    CreateAccountHolderOutput,
+    SavePaymentMethodInput,
+    SavePaymentMethodOutput,
+    ListPaymentMethodsInput,
+    ListPaymentMethodsOutput,
+    DeleteAccountHolderInput,
+    DeleteAccountHolderOutput,
 } from "@medusajs/framework/types"
 import {
     FenaClient,
     FenaPaymentStatus,
     FenaPaymentMethod,
     getErrorMessage,
+    FenaManagedEntityType,
+    FenaRecurringPaymentFrequency,
     type FenaWebhookPayload,
+    type FenaRecurringPayment,
 } from "../../lib/fena-client"
 
 // ────────────────────────────────────────────────────────
@@ -139,16 +150,60 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         const { amount, currency_code, context } = input
 
         try {
-            // Fena requires max 12-char alphanumeric reference.
-            // We keep the truncated reference for Fena, but embed the full Medusa session ID
-            // in the description field (no length limit) so we can recover it during webhook.
+            const isRecurring = !!input.data?.is_recurring
             const sessionId = getDataString(input.data, "session_id") ?? `cart_${Date.now()}`
             const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
-
-            // Fena strictly requires the format "/^[0-9]*\.[0-9]{2}$/"
-            // Medusa v2 amounts are exact (20 = €20.00), not in cents.
             const formattedAmount = Number(amount).toFixed(2)
 
+            if (isRecurring) {
+                // 1. Calculate 6-working-day delay (at least)
+                const startDate = new Date()
+                let addedDays = 0
+                while (addedDays < 6) {
+                    startDate.setDate(startDate.getDate() + 1)
+                    const day = startDate.getDay()
+                    if (day !== 0 && day !== 6) { // Skip Sunday(0) and Saturday(6)
+                        addedDays++
+                    }
+                }
+
+                // Determine frequency and other recurring params from metadata or default
+                const frequency = (input.data?.frequency as FenaRecurringPaymentFrequency) || FenaRecurringPaymentFrequency.OneMonth
+
+                const response = await this.client_.createAndProcessRecurringPayment({
+                    reference,
+                    recurringAmount: formattedAmount,
+                    recurringPaymentDate: startDate.toISOString(),
+                    numberOfPayments: 0, // Indefinite by default
+                    frequency,
+                    initialPaymentAmount: formattedAmount, // CHARGE IMMEDIATELY
+                    bankAccount: this.options_.bankAccountId,
+                    customerName: context?.customer?.first_name
+                        ? `${context.customer.first_name} ${context.customer.last_name || ""}`.trim()
+                        : "Customer",
+                    customerEmail: context?.customer?.email || "unknown@example.com",
+                    notes: [{ text: `medusa_session:${sessionId}`, visibility: "private" }],
+                })
+
+                const payment = response.result
+                return {
+                    id: payment.id,
+                    data: {
+                        ...input.data,
+                        fena_payment_id: payment.id,
+                        fena_recurring_id: payment.id,
+                        fena_payment_link: payment.link,
+                        fena_qr_code_data: payment.qrCodeData,
+                        fena_payment_status: payment.status,
+                        fena_reference: reference,
+                        is_recurring: true,
+                        currency_code,
+                        session_id: sessionId,
+                    },
+                }
+            }
+
+            // Standard Single Payment
             const response = await this.client_.createAndProcessPayment({
                 reference,
                 amount: formattedAmount,
@@ -203,7 +258,8 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
     async authorizePayment(
         input: AuthorizePaymentInput
     ): Promise<AuthorizePaymentOutput> {
-        const fenaPaymentId = getDataString(input.data, "fena_payment_id")
+        const { data, context } = input
+        const fenaPaymentId = getDataString(data, "fena_payment_id") || getDataString(data, "fena_recurring_id")
 
         if (!fenaPaymentId) {
             throw new MedusaError(
@@ -213,8 +269,24 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         }
 
         try {
-            const payment = await this.client_.getPayment(fenaPaymentId)
+            // Handle off-session renewals (V2.5+ pattern)
+            if (input.data?.off_session) {
+                this.logger_.info(`Fena: authorizePayment (off-session) — confirming context for renewal ${fenaPaymentId}`)
+                // For standing orders, we just check if it's still active.
+                // The actual money capture will happen via webhook when the bank pushes.
+                const payment = await this.getPaymentOrRecurring(fenaPaymentId)
+                const status = this.mapFenaStatusToMedusa(payment.status)
+                
+                return {
+                    data: {
+                        ...input.data,
+                        fena_payment_status: payment.status,
+                    },
+                    status,
+                }
+            }
 
+            const payment = await this.getPaymentOrRecurring(fenaPaymentId)
             const status = this.mapFenaStatusToMedusa(payment.status)
 
             this.logger_.info(
@@ -250,17 +322,17 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
     async capturePayment(
         input: CapturePaymentInput
     ): Promise<CapturePaymentOutput> {
-        const fenaPaymentId = getDataString(input.data, "fena_payment_id")
+        const fenaPaymentId = getDataString(input.data, "fena_payment_id") || getDataString(input.data, "fena_recurring_id")
 
         if (!fenaPaymentId) {
             return { data: input.data }
         }
 
         try {
-            const payment = await this.client_.getPayment(fenaPaymentId)
+            const payment = await this.getPaymentOrRecurring(fenaPaymentId)
 
-            if (payment.status === FenaPaymentStatus.Paid) {
-                this.logger_.info(`Fena: Payment ${fenaPaymentId} confirmed as paid`)
+            if (payment.status === FenaPaymentStatus.Paid || payment.status === "active") {
+                this.logger_.info(`Fena: Payment ${fenaPaymentId} confirmed as captured/active`)
                 return {
                     data: {
                         ...input.data,
@@ -478,17 +550,34 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             let authenticStatus = webhookStatus
 
             try {
-                const payment = await this.client_.getPayment(fenaPaymentId)
-                authenticStatus = payment.status
+                // Try Single Payment first
+                try {
+                    const payment = await this.client_.getPayment(fenaPaymentId)
+                    authenticStatus = payment.status
 
-                const descMatch = payment.description?.match(/\[medusa_session:([^\]]+)\]/)
-                if (descMatch) {
-                    sessionId = descMatch[1]
-                    this.logger_.info(`Fena webhook: recovered session_id from description: ${sessionId}`)
-                } else {
-                    // Fallback: use reference (will likely fail but log it for debugging)
+                    const descMatch = payment.description?.match(/\[medusa_session:([^\]]+)\]/)
+                    if (descMatch) {
+                        sessionId = descMatch[1]
+                        this.logger_.info(`Fena webhook: recovered session_id from description: ${sessionId}`)
+                    }
+                } catch (e) {
+                    // Try Recurring Payment
+                    const recurring = await this.client_.getRecurringPayment(fenaPaymentId)
+                    authenticStatus = recurring.status
+                    
+                    // Search in notes for medusa_session
+                    const sessionNote = recurring.transactions?.[0]?.notes?.find((n: any) => n.key === "medusa_session") || 
+                                       (recurring as any).notes?.find((n: any) => n.key === "medusa_session")
+                    
+                    if (sessionNote) {
+                        sessionId = sessionNote.value
+                        this.logger_.info(`Fena webhook: recovered session_id from recurring notes: ${sessionId}`)
+                    }
+                }
+
+                if (!sessionId) {
                     sessionId = reference || ""
-                    this.logger_.warn(`Fena webhook: no session_id in description, using reference: ${sessionId}`)
+                    this.logger_.warn(`Fena webhook: no session_id found, using reference fallback: ${sessionId}`)
                 }
             } catch (err: any) {
                 sessionId = reference || ""
@@ -504,15 +593,27 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             // Map authentic Fena payment status to Medusa payment actions
             switch (authenticStatus) {
+                case "active":
+                case "payment-made":
                 case FenaPaymentStatus.Paid:
                     return {
                         action: PaymentActions.SUCCESSFUL,
                         data: payloadData,
                     }
 
+                case "sent":
                 case FenaPaymentStatus.Pending:
                     return {
                         action: PaymentActions.AUTHORIZED,
+                        data: payloadData,
+                    }
+
+                case "payment-missed":
+                case "cancelled":
+                case FenaPaymentStatus.Cancelled:
+                case FenaPaymentStatus.Rejected:
+                    return {
+                        action: PaymentActions.FAILED,
                         data: payloadData,
                     }
 
@@ -578,27 +679,118 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
     ): FenaWebhookPayload | null {
         if (typeof data !== "object" || data === null) return null
 
-        const id = data.id
-        const status = data.status
+        const id = (data.id || (data as any).recurring_id) as string
+        const status = (data.status || (data as any).statusName) as string
+        const eventScope = data.eventScope as string
+        const eventName = data.eventName as string
 
-        if (typeof id !== "string" || typeof status !== "string") return null
+        if (typeof id !== "string" || (typeof status !== "string" && !eventName)) return null
 
         return {
             id,
-            status: status as FenaPaymentStatus,
-            reference: typeof data.reference === "string" ? data.reference : "",
-            amount: typeof data.amount === "string" ? data.amount : "0",
-            currency: typeof data.currency === "string" ? data.currency : "",
+            status: (status || eventName) as FenaPaymentStatus,
+            reference: (typeof data.reference === "string" ? data.reference : "") || 
+                       (typeof (data as any).invoiceRefNumber === "string" ? (data as any).invoiceRefNumber : ""),
+            amount: (typeof data.amount === "string" ? data.amount : "") || 
+                    (typeof (data as any).recurringAmount === "string" ? (data as any).recurringAmount : "0"),
+            currency: typeof data.currency === "string" ? data.currency : "GBP",
+            eventScope,
+            eventName,
+            notes: (data as any).notes
         }
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Account Holder (Medusa v2.5+)
+    // ──────────────────────────────────────────────────────
+
+    /**
+     * Creates an account holder in Fena (Managed Entity).
+     */
+    async createAccountHolder({ context, data }: CreateAccountHolderInput): Promise<CreateAccountHolderOutput> {
+        const { account_holder, customer } = context
+
+        if (account_holder?.data?.id) {
+            return { id: account_holder.data.id as string }
+        }
+
+        if (!customer) {
+            throw new MedusaError(
+                MedusaError.Types.INVALID_DATA,
+                "Missing customer data for Fena Account Holder creation."
+            )
+        }
+
+        try {
+            const managedEntity = await this.client_.createManagedEntity({
+                name: `${customer.first_name} ${customer.last_name || ""}`.trim() || customer.email,
+                type: FenaManagedEntityType.Consumer,
+            })
+
+            return {
+                id: managedEntity.id,
+                data: managedEntity as any,
+            }
+        } catch (error: any) {
+            this.logger_.error(`Fena: createAccountHolder failed — ${getErrorMessage(error)}`)
+            throw new MedusaError(
+                MedusaError.Types.UNEXPECTED_STATE,
+                `Failed to create Fena Managed Entity: ${getErrorMessage(error)}`
+            )
+        }
+    }
+
+    /**
+     * Saves a payment method for an account holder.
+     * For Fena recurring, this is the Standing Order authorization.
+     */
+    async savePaymentMethod({ context, data }: SavePaymentMethodInput): Promise<SavePaymentMethodOutput> {
+        const fenaPaymentId = getDataString(data, "fena_payment_id")
+
+        if (!fenaPaymentId) {
+            throw new MedusaError(
+                MedusaError.Types.INVALID_DATA,
+                "Missing Fena payment ID to save payment method."
+            )
+        }
+
+        return {
+            id: fenaPaymentId,
+            data: {
+                ...data,
+                fena_saved_payment_id: fenaPaymentId,
+            },
+        }
+    }
+
+    /**
+     * Lists saved payment methods for an account holder.
+     */
+    async listPaymentMethods(context: ListPaymentMethodsInput): Promise<ListPaymentMethodsOutput> {
+        // Return saved payment methods if available in Medusa account holder data
+        return []
+    }
+
+    /**
+     * Deletes an account holder in Fena.
+     */
+    async deleteAccountHolder(context: DeleteAccountHolderInput): Promise<DeleteAccountHolderOutput> {
+        // Optional: delete managed entity in Fena if desired
+        return {}
     }
 
     /**
      * Maps Fena payment statuses to Medusa PaymentSessionStatus values.
      */
     private mapFenaStatusToMedusa(
-        fenaStatus: FenaPaymentStatus
+        fenaStatus: FenaPaymentStatus | string
     ): PaymentSessionStatus {
         switch (fenaStatus) {
+            case "active":
+            case FenaPaymentStatus.Paid:
+                return "captured" as PaymentSessionStatus
+
+            case "sent":
             case FenaPaymentStatus.Draft:
             case FenaPaymentStatus.Sent:
             case FenaPaymentStatus.Overdue:
@@ -607,12 +799,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             case FenaPaymentStatus.Pending:
                 return "authorized" as PaymentSessionStatus
 
-            case FenaPaymentStatus.Paid:
-                return "captured" as PaymentSessionStatus
-
             case FenaPaymentStatus.Rejected:
                 return "error" as PaymentSessionStatus
 
+            case "cancelled":
             case FenaPaymentStatus.Cancelled:
                 return "canceled" as PaymentSessionStatus
 
@@ -623,6 +813,23 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             default:
                 return "pending" as PaymentSessionStatus
+        }
+    }
+
+    /**
+     * Helper to retrieve either a single payment or a recurring payment.
+     */
+    private async getPaymentOrRecurring(id: string): Promise<any> {
+        try {
+            // Check if it's a single payment first
+            return await this.client_.getPayment(id)
+        } catch (e) {
+            // Try recurring
+            try {
+                return await this.client_.getRecurringPayment(id)
+            } catch (recurringError) {
+                throw new Error(`Failed to retrieve payment or recurring payment with ID ${id}`)
+            }
         }
     }
 }

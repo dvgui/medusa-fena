@@ -27,6 +27,16 @@ export {
     type FenaTransactionListResponse,
     // Bank account types
     type FenaBankAccount,
+    // Managed Entity types
+    FenaManagedEntityType,
+    type FenaManagedEntityInput,
+    type FenaManagedEntity,
+    // Recurring Payment types
+    FenaRecurringPaymentFrequency,
+    type CreateRecurringPaymentInput,
+    type FenaRecurringPayment,
+    type FenaRecurringPaymentWithLink,
+    type FenaCreateRecurringPaymentResponse,
     // Webhook types
     type FenaWebhookPayload,
     type FenaBankAccountWebhookPayload,

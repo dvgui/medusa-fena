@@ -213,6 +213,96 @@ export interface FenaTransactionListResponse {
 }
 
 // ============================================================
+// Managed Entities (Account Holders)
+// ============================================================
+
+export enum FenaManagedEntityType {
+    Consumer = "consumer",
+    Company = "company",
+}
+
+export interface FenaManagedEntityInput {
+    name: string
+    type: FenaManagedEntityType
+    countryCode?: string
+    address?: {
+        addressLine1: string
+        city: string
+        zipCode: string
+        country: string
+    }
+}
+
+export interface FenaManagedEntity {
+    id: string
+    name: string
+    type: FenaManagedEntityType
+    isSandbox: boolean
+    createdAt: string
+    updatedAt: string
+}
+
+// ============================================================
+// Recurring Payments
+// ============================================================
+
+export enum FenaRecurringPaymentFrequency {
+    OneWeek = "one_week",
+    OneMonth = "one_month",
+    ThreeMonths = "three_months",
+    OneYear = "one_year",
+}
+
+export interface CreateRecurringPaymentInput {
+    /** Unique reference (max 12 chars, alphanumeric) */
+    reference: string
+    /** Amount in decimal string, e.g. "9.50" */
+    recurringAmount: string
+    /** First payment date (ISO 8601; must be >= 6 working days in future) */
+    recurringPaymentDate: string
+    /** Number of payments (0 for indefinite) */
+    numberOfPayments: number
+    /** Frequency of payments */
+    frequency: FenaRecurringPaymentFrequency
+    /** Optional initial payment amount for immediate capture */
+    initialPaymentAmount?: string
+    /** Bank account ID of destination bank */
+    bankAccount?: string
+    /** Customer details (Required for Toolkit) */
+    customerName: string
+    customerEmail: string
+    /** Optional notes */
+    notes?: Array<{ text: string; visibility: "public" | "private" }>
+}
+
+export interface FenaRecurringPayment {
+    id: string
+    invoiceRefNumber: string
+    recurringAmount: string
+    firstPaymentDate: string
+    finalPaymentDate?: string
+    expectedNumberOfPayments: number
+    frequency: FenaRecurringPaymentFrequency
+    status: "sent" | "active" | "cancelled" | "overdue"
+    transactions: any[]
+    customerName?: string
+    customerEmail?: string
+    createdAt: string
+    currency: string
+    bankAccount?: any
+}
+
+export interface FenaRecurringPaymentWithLink extends FenaRecurringPayment {
+    link: string
+    qrCodeData: string
+}
+
+export interface FenaCreateRecurringPaymentResponse {
+    created: boolean
+    result: FenaRecurringPaymentWithLink
+}
+
+// ============================================================
 // Webhook Payload
 // ============================================================
 
@@ -226,16 +316,22 @@ export interface FenaTransactionListResponse {
  *   - status: payment status
  */
 export interface FenaWebhookPayload {
-    /** The Fena payment ID */
+    /** The Fena payment ID (single or recurring) */
     id: string
     /** Payment status */
-    status: FenaPaymentStatus
+    status: FenaPaymentStatus | string
     /** The payment reference you provided */
     reference: string
     /** Amount */
     amount: string
     /** Currency code */
     currency: string
+    /** Recurring specific fields */
+    eventScope?: string
+    eventName?: string
+    invoiceRefNumber?: string
+    recurringAmount?: string
+    notes?: { text: string; visibility: "public" | "private" }[]
     /** Additional fields Fena may include */
     [key: string]: unknown
 }

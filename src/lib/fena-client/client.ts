@@ -17,6 +17,14 @@ import type {
     FenaPaymentWithLink,
     FenaTransaction,
     FenaTransactionListResponse,
+    FenaManagedEntityType,
+    FenaManagedEntityInput,
+    FenaManagedEntity,
+    FenaRecurringPaymentFrequency,
+    CreateRecurringPaymentInput,
+    FenaRecurringPayment,
+    FenaRecurringPaymentWithLink,
+    FenaCreateRecurringPaymentResponse,
 } from "./types"
 
 /** Default Fena API base URL. Override via `baseUrl` in config. */
@@ -149,6 +157,83 @@ export class FenaClient {
     async processPayment(id: string): Promise<FenaPaymentWithLink> {
         const res = await this.request<{ saved: boolean; result: FenaPaymentWithLink }>("POST", `/open/payments/single/${id}/process`)
         return res.result
+    }
+
+    // ────────────────────────────────────────────────────────
+    // Recurring Payments
+    // ────────────────────────────────────────────────────────
+
+    /**
+     * Create a draft recurring payment.
+     *
+     * `POST /payments/recurring/create`
+     */
+    async createDraftRecurringPayment(input: CreateRecurringPaymentInput): Promise<FenaCreateRecurringPaymentResponse> {
+        return this.request("POST", "/payments/recurring/create", input)
+    }
+
+    /**
+     * Create and process a recurring payment.
+     *
+     * `POST /payments/recurring/create-and-process`
+     */
+    async createAndProcessRecurringPayment(input: CreateRecurringPaymentInput): Promise<FenaCreateRecurringPaymentResponse> {
+        return this.request("POST", "/payments/recurring/create-and-process", input)
+    }
+
+    /**
+     * Get a recurring payment by ID.
+     *
+     * `GET /payments/recurring/{id}`
+     */
+    async getRecurringPayment(id: string): Promise<FenaRecurringPayment> {
+        const res = await this.request<{ data: FenaRecurringPayment }>("GET", `/payments/recurring/${id}`)
+        return res.data
+    }
+
+    /**
+     * Process a draft recurring payment.
+     *
+     * `POST /payments/recurring/{id}/process`
+     */
+    async processRecurringPayment(id: string): Promise<FenaRecurringPaymentWithLink> {
+        const res = await this.request<{ result: FenaRecurringPaymentWithLink }>("POST", `/payments/recurring/${id}/process`)
+        return res.result
+    }
+
+    /**
+     * Delete/Cancel a recurring payment.
+     *
+     * `POST /payments/recurring/{id}/delete`
+     */
+    async deleteRecurringPayment(id: string): Promise<boolean> {
+        const res = await this.request<{ deleted: boolean }>("POST", `/payments/recurring/${id}/delete`)
+        return res.deleted
+    }
+
+    // ────────────────────────────────────────────────────────
+    // Managed Entities (Account Holders)
+    // ────────────────────────────────────────────────────────
+
+    /**
+     * Create a managed entity (e.g., consumer/account holder).
+     * Note: This usually requires Partner API access.
+     *
+     * `POST /companies/info/create`
+     */
+    async createManagedEntity(input: FenaManagedEntityInput): Promise<FenaManagedEntity> {
+        const res = await this.request<{ data: FenaManagedEntity }>("POST", "/companies/info/create", input)
+        return res.data
+    }
+
+    /**
+     * Get a managed entity by ID.
+     *
+     * `GET /companies/info/{id}`
+     */
+    async getManagedEntity(id: string): Promise<FenaManagedEntity> {
+        const res = await this.request<{ data: FenaManagedEntity }>("GET", `/companies/info/${id}`)
+        return res.data
     }
 
     // ────────────────────────────────────────────────────────
