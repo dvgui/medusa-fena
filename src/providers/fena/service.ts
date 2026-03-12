@@ -229,6 +229,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             return {
                 id: payment.id,
                 data: {
+                    ...input.data,
                     fena_payment_id: payment.id,
                     fena_payment_link: payment.link,
                     fena_qr_code_data: payment.qrCodeData,
@@ -270,10 +271,13 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
         try {
             // Handle off-session renewals or passive records
-            if (input.data?.off_session || input.data?.is_passive) {
-                this.logger_.info(`Fena: authorizePayment (${input.data?.is_passive ? "passive" : "off-session"}) — confirming context ${fenaPaymentId}`)
+            const isPassive = input.data?.is_passive || (input.context as any)?.is_passive
+            const isOffSession = input.data?.off_session || (input.context as any)?.off_session
+
+            if (isPassive || isOffSession) {
+                this.logger_.info(`Fena: authorizePayment (${isPassive ? "passive" : "off-session"}) — confirming context ${fenaPaymentId}`)
                 
-                if (input.data?.is_passive) {
+                if (isPassive) {
                     return {
                         data: {
                             ...input.data,
