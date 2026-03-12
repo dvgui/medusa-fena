@@ -269,9 +269,20 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         }
 
         try {
-            // Handle off-session renewals (V2.5+ pattern)
-            if (input.data?.off_session) {
-                this.logger_.info(`Fena: authorizePayment (off-session) — confirming context for renewal ${fenaPaymentId}`)
+            // Handle off-session renewals or passive records
+            if (input.data?.off_session || input.data?.is_passive) {
+                this.logger_.info(`Fena: authorizePayment (${input.data?.is_passive ? "passive" : "off-session"}) — confirming context ${fenaPaymentId}`)
+                
+                if (input.data?.is_passive) {
+                    return {
+                        data: {
+                            ...input.data,
+                            fena_payment_status: "paid",
+                        },
+                        status: "captured" as PaymentSessionStatus,
+                    }
+                }
+                
                 // For standing orders, we just check if it's still active.
                 // The actual money capture will happen via webhook when the bank pushes.
                 const payment = await this.getPaymentOrRecurring(fenaPaymentId)
