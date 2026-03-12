@@ -331,7 +331,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         try {
             const payment = await this.getPaymentOrRecurring(fenaPaymentId)
 
-            if (payment.status === FenaPaymentStatus.Paid || payment.status === "active") {
+            if (payment.status === FenaPaymentStatus.Paid || payment.status === "active" || payment.status === "payment-made") {
                 this.logger_.info(`Fena: Payment ${fenaPaymentId} confirmed as captured/active`)
                 return {
                     data: {
@@ -479,7 +479,6 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 amount: amount?.toString(),
                 currency_code,
             },
-            status: "pending" as PaymentSessionStatus,
         }
     }
 
@@ -591,10 +590,14 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 amount: new BigNumber(amount || 0),
             }
 
+            const normalizedStatus = authenticStatus.toLowerCase()
+
             // Map authentic Fena payment status to Medusa payment actions
-            switch (authenticStatus) {
+            switch (normalizedStatus) {
                 case "active":
                 case "payment-made":
+                case "payment-confirmed":
+                case "paid":
                 case FenaPaymentStatus.Paid:
                     return {
                         action: PaymentActions.SUCCESSFUL,
@@ -602,6 +605,8 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     }
 
                 case "sent":
+                case "pending":
+                case FenaPaymentStatus.Sent:
                 case FenaPaymentStatus.Pending:
                     return {
                         action: PaymentActions.AUTHORIZED,
@@ -617,25 +622,8 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         data: payloadData,
                     }
 
-                case FenaPaymentStatus.Sent:
-                    // Payment link sent, waiting for customer — no action needed
-                    return {
-                        action: PaymentActions.NOT_SUPPORTED,
-                        data: payloadData,
-                    }
-
-                case FenaPaymentStatus.Rejected:
-                    return {
-                        action: PaymentActions.FAILED,
-                        data: payloadData,
-                    }
-
-                case FenaPaymentStatus.Cancelled:
-                    return {
-                        action: PaymentActions.CANCELED,
-                        data: payloadData,
-                    }
-
+                case "refunded":
+                case "partial-refund":
                 case FenaPaymentStatus.Refunded:
                 case FenaPaymentStatus.PartialRefund:
                     return {
@@ -645,7 +633,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
                 default:
                     this.logger_.info(
-                        `Fena webhook: Unhandled status "${authenticStatus}" for payment ${fenaPaymentId}`
+                        `Fena webhook: Unhandled status "${normalizedStatus}" for payment ${fenaPaymentId}`
                     )
                     return {
                         action: PaymentActions.NOT_SUPPORTED,
@@ -787,20 +775,29 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
     private mapFenaStatusToMedusa(
         fenaStatus: FenaPaymentStatus | string
     ): PaymentSessionStatus {
-        switch (fenaStatus) {
+        const normalizedStatus = (fenaStatus as string).toLowerCase()
+
+        switch (normalizedStatus) {
             case "active":
+            case "payment-made":
+            case "payment-confirmed":
+            case "paid":
             case FenaPaymentStatus.Paid:
                 return "captured" as PaymentSessionStatus
 
             case "sent":
-            case FenaPaymentStatus.Draft:
+            case "pending":
             case FenaPaymentStatus.Sent:
-            case FenaPaymentStatus.Overdue:
-                return "pending" as PaymentSessionStatus
-
             case FenaPaymentStatus.Pending:
                 return "authorized" as PaymentSessionStatus
 
+            case "draft":
+            case "overdue":
+            case FenaPaymentStatus.Draft:
+            case FenaPaymentStatus.Overdue:
+                return "pending" as PaymentSessionStatus
+
+            case "payment-missed":
             case FenaPaymentStatus.Rejected:
                 return "error" as PaymentSessionStatus
 
