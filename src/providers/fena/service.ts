@@ -303,15 +303,15 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             const payment = await this.getPaymentOrRecurring(fenaPaymentId)
 
-            // Medusa's authorizePaymentSession ONLY accepts "authorized" status.
-            // Any Fena status indicating the customer approved the payment should
-            // return "authorized". Subsequent capture happens via webhook.
+            // Medusa's authorizePaymentSession only accepts "authorized" or "captured".
+            // Only return "authorized" when the bank has CONFIRMED payment.
+            // "sent" = just sent to bank, NOT confirmed — return "pending".
             const fenaStatus = payment.status.toLowerCase()
-            const approvedStatuses = ["sent", "paid", "active", "payment-made", "payment-confirmed"]
-            const isApproved = approvedStatuses.includes(fenaStatus)
+            const confirmedStatuses = ["paid", "active", "payment-made", "payment-confirmed"]
+            const isConfirmed = confirmedStatuses.includes(fenaStatus)
 
             this.logger_.info(
-                `Fena: authorizePayment — ID: ${fenaPaymentId}, Fena status: ${payment.status}, approved: ${isApproved}`
+                `Fena: authorizePayment — ID: ${fenaPaymentId}, Fena status: ${payment.status}, confirmed: ${isConfirmed}`
             )
 
             return {
@@ -319,7 +319,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     ...input.data,
                     fena_payment_status: payment.status,
                 },
-                status: (isApproved ? "authorized" : "pending") as PaymentSessionStatus,
+                status: (isConfirmed ? "authorized" : "pending") as PaymentSessionStatus,
             }
         } catch (error: unknown) {
             const msg = getErrorMessage(error)
@@ -626,16 +626,17 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
                 case "sent":
                 case FenaPaymentStatus.Sent:
-                    // "sent" = customer authorized in banking app, payment sent to bank.
-                    // This IS authorization — trigger cart completion.
+                    // "sent" = payment request sent to bank. Customer may or may not
+                    // have confirmed. Do NOT create order yet — wait for "paid".
+                    this.logger_.info(`Fena webhook: status "sent" — waiting for bank confirmation, skipping.`)
                     return {
-                        action: PaymentActions.AUTHORIZED,
+                        action: PaymentActions.PENDING,
                         data: payloadData,
                     }
 
                 case "pending":
                 case FenaPaymentStatus.Pending:
-                    // Truly pending — not yet authorized by customer.
+                    // Truly pending — not yet sent to bank.
                     return {
                         action: PaymentActions.PENDING,
                         data: payloadData,
