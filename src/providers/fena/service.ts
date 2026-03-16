@@ -276,7 +276,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             if (isPassive || isOffSession) {
                 this.logger_.info(`Fena: authorizePayment (${isPassive ? "passive" : "off-session"}) — confirming context ${fenaPaymentId}`)
-                
+
                 if (isPassive) {
                     return {
                         data: {
@@ -286,12 +286,12 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         status: "captured" as PaymentSessionStatus,
                     }
                 }
-                
+
                 // For standing orders, we just check if it's still active.
                 // The actual money capture will happen via webhook when the bank pushes.
                 const payment = await this.getPaymentOrRecurring(fenaPaymentId)
                 const status = this.mapFenaStatusToMedusa(payment.status)
-                
+
                 return {
                     data: {
                         ...input.data,
@@ -577,11 +577,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     // Try Recurring Payment
                     const recurring = await this.client_.getRecurringPayment(fenaPaymentId)
                     authenticStatus = recurring.status
-                    
+
                     // Search in notes for medusa_session
-                    const sessionNote = recurring.transactions?.[0]?.notes?.find((n: any) => n.key === "medusa_session") || 
-                                       (recurring as any).notes?.find((n: any) => n.key === "medusa_session")
-                    
+                    const sessionNote = recurring.transactions?.[0]?.notes?.find((n: any) => n.key === "medusa_session") ||
+                        (recurring as any).notes?.find((n: any) => n.key === "medusa_session")
+
                     if (sessionNote) {
                         sessionId = sessionNote.value
                         this.logger_.info(`Fena webhook: recovered session_id from recurring notes: ${sessionId}`)
@@ -622,8 +622,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 case "pending":
                 case FenaPaymentStatus.Sent:
                 case FenaPaymentStatus.Pending:
+                    // Payment request sent to bank but not yet confirmed.
+                    // Don't trigger cart completion — wait for "paid" status.
                     return {
-                        action: PaymentActions.AUTHORIZED,
+                        action: PaymentActions.PENDING,
                         data: payloadData,
                     }
 
@@ -691,10 +693,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         return {
             id,
             status: (status || eventName) as FenaPaymentStatus,
-            reference: (typeof data.reference === "string" ? data.reference : "") || 
-                       (typeof (data as any).invoiceRefNumber === "string" ? (data as any).invoiceRefNumber : ""),
-            amount: (typeof data.amount === "string" ? data.amount : "") || 
-                    (typeof (data as any).recurringAmount === "string" ? (data as any).recurringAmount : "0"),
+            reference: (typeof data.reference === "string" ? data.reference : "") ||
+                (typeof (data as any).invoiceRefNumber === "string" ? (data as any).invoiceRefNumber : ""),
+            amount: (typeof data.amount === "string" ? data.amount : "") ||
+                (typeof (data as any).recurringAmount === "string" ? (data as any).recurringAmount : "0"),
             currency: typeof data.currency === "string" ? data.currency : "GBP",
             eventScope,
             eventName,
@@ -725,7 +727,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
         try {
             this.logger_.info(`Fena: creating local account holder for ${customer.email}`)
-            
+
             const managedEntity = await this.client_.createManagedEntity({
                 name: `${customer.first_name} ${customer.last_name || ""}`.trim() || customer.email,
                 type: FenaManagedEntityType.Consumer,
