@@ -356,17 +356,16 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 }
             }
 
-            // If not paid yet, still return the data — the webhook will handle it
-            this.logger_.warn(
-                `Fena: capturePayment — payment ${fenaPaymentId} status is "${payment.status}", not "paid" yet`
-            )
-            return {
-                data: {
-                    ...input.data,
-                    fena_payment_status: payment.status,
-                },
-            }
+            // Payment NOT confirmed by the bank yet — throw so Medusa does NOT
+            // mark this as captured. The event-bus will retry the subscriber,
+            // and when Fena sends the "paid" webhook, PaymentActions.SUCCESSFUL
+            // will handle the capture automatically.
+            const msg = `Fena: capturePayment — payment ${fenaPaymentId} status is "${payment.status}", not "paid" yet. Capture will be retried.`
+            this.logger_.warn(msg)
+            throw new MedusaError(MedusaError.Types.PAYMENT_REQUIRES_MORE_ERROR, msg)
         } catch (error: unknown) {
+            // Re-throw intentional MedusaErrors (e.g. payment not yet confirmed)
+            if (error instanceof MedusaError) throw error
             this.logger_.error(`Fena: capturePayment failed — ${getErrorMessage(error)}`)
             return { data: input.data }
         }
