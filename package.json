@@ -1,6 +1,6 @@
 {
   "name": "@baam25/fena-plugin",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Fena Open Banking Payment Provider for MedusaJS v2.",
   "author": "Baam25",
   "license": "MIT",

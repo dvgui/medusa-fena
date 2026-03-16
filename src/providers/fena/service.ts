@@ -309,9 +309,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const fenaStatus = payment.status.toLowerCase()
             const confirmedStatuses = ["paid", "active", "payment-made", "payment-confirmed"]
             const isConfirmed = confirmedStatuses.includes(fenaStatus)
+            const isSent = fenaStatus === "sent" || fenaStatus === FenaPaymentStatus.Sent
 
             this.logger_.info(
-                `[v2.3] Fena: authorizePayment — ID: ${fenaPaymentId}, Fena status: ${payment.status}, confirmed: ${isConfirmed}`
+                `[v2.4] Fena: authorizePayment — ID: ${fenaPaymentId}, Fena status: ${payment.status}, confirmed: ${isConfirmed}, isSent: ${isSent}`
             )
 
             return {
@@ -319,7 +320,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     ...input.data,
                     fena_payment_status: payment.status,
                 },
-                status: (isConfirmed ? "authorized" : "pending") as PaymentSessionStatus,
+                status: (isConfirmed || isSent ? "authorized" : "pending") as PaymentSessionStatus,
             }
         } catch (error: unknown) {
             const msg = getErrorMessage(error)
@@ -366,7 +367,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             // mark this as captured. The event-bus will retry the subscriber,
             // and when Fena sends the "paid" webhook, PaymentActions.SUCCESSFUL
             // will handle the capture automatically.
-            const msg = `[v2.3] Fena: capturePayment — payment ${fenaPaymentId} status is "${payment.status}", not "paid" yet. Capture will be retried.`
+            const msg = `[v2.4] Fena: capturePayment — payment ${fenaPaymentId} status is "${payment.status}", not "paid" yet. Capture will be retried.`
             this.logger_.warn(msg)
             throw new MedusaError(MedusaError.Types.PAYMENT_REQUIRES_MORE_ERROR, msg)
         } catch (error: unknown) {
@@ -379,7 +380,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 throw error
             }
             
-            this.logger_.error(`[v2.3] Fena: capturePayment failed — ${getErrorMessage(error)}`)
+            this.logger_.error(`[v2.4] Fena: capturePayment failed — ${getErrorMessage(error)}`)
             // Don't return success data if we failed – throw something to stop Medusa
             throw error 
         }
@@ -633,11 +634,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
                 case "sent":
                 case FenaPaymentStatus.Sent:
-                    // "sent" = payment request sent to bank. Customer may or may not
-                    // have confirmed. Do NOT create order yet — wait for "paid".
-                    this.logger_.info(`[v2.3] Fena webhook: status "sent" — returning PENDING, skipping order creation.`)
+                    // "sent" = payment request sent to bank. Return AUTHORIZED to
+                    // allow order creation, but capturePayment will reject it until "paid".
+                    this.logger_.info(`[v2.4] Fena webhook: status "sent" — returning AUTHORIZED.`)
                     return {
-                        action: PaymentActions.PENDING,
+                        action: PaymentActions.AUTHORIZED,
                         data: payloadData,
                     }
 
