@@ -634,19 +634,21 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
                 case "sent":
                 case FenaPaymentStatus.Sent:
-                    // "sent" = payment request sent to bank. Return PENDING to
-                    // prevent premature order creation. Confirmation comes later via "paid".
-                    this.logger_.info(`[v2.5] Fena webhook: status "sent" — returning PENDING.`)
+                    // "sent" = payment request sent to bank. Return NOT_SUPPORTED to
+                    // avoid triggering Medusa's authorization workflow prematurely. 
+                    this.logger_.info(`[v2.5] Fena webhook: status "sent" — returning NOT_SUPPORTED.`)
                     return {
-                        action: PaymentActions.PENDING,
+                        action: PaymentActions.NOT_SUPPORTED,
                         data: payloadData,
                     }
 
                 case "pending":
                 case FenaPaymentStatus.Pending:
-                    // Truly pending — not yet sent to bank.
+                    // Truly pending — not yet sent to bank. Return NOT_SUPPORTED
+                    // to avoid triggering Medusa's authorization workflow prematurely. 
+                    this.logger_.info(`[v2.5] Fena webhook: status "pending" — returning NOT_SUPPORTED.`)
                     return {
-                        action: PaymentActions.PENDING,
+                        action: PaymentActions.NOT_SUPPORTED,
                         data: payloadData,
                     }
 
