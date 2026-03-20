@@ -155,6 +155,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
             const formattedAmount = Number(amount).toFixed(2)
 
+            this.logger_.info(
+                `Fena: initiatePayment debug info — Input Data Keys: ${Object.keys(input.data || {}).join(", ")}, Context Keys: ${Object.keys(context || {}).join(", ")}`
+            )
+            this.logger_.info(`Fena Debug — context.email: ${(context as any)?.email}, context.customer.email: ${context?.customer?.email}, input.data.email: ${(input.data as any)?.email}`)
+
             const customerEmail = (context?.customer?.email || (context as any)?.email || (input.data as any)?.email) as string | undefined
             const customerFirstName = context?.customer?.first_name || (input.data as any)?.first_name
             const customerLastName = context?.customer?.last_name || (input.data as any)?.last_name
