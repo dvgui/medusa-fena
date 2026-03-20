@@ -155,6 +155,19 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
             const formattedAmount = Number(amount).toFixed(2)
 
+            const customerEmail = (context?.customer?.email || (context as any)?.email || (input.data as any)?.email) as string | undefined
+            const customerFirstName = context?.customer?.first_name || (input.data as any)?.first_name
+            const customerLastName = context?.customer?.last_name || (input.data as any)?.last_name
+            const customerNameFallback = (input.data as any)?.customer_name || (input.data as any)?.name
+
+            const customerName = (customerFirstName 
+                ? `${customerFirstName} ${customerLastName || ""}`.trim() 
+                : customerNameFallback) as string | undefined
+
+            this.logger_.info(
+                `Fena: Creating ${isRecurring ? "recurring " : ""}payment for ${sessionId} — Email: ${customerEmail || "N/A"}, Name: ${customerName || "N/A"}`
+            )
+
             if (isRecurring) {
                 // 1. Calculate 6-working-day delay (at least)
                 const startDate = new Date()
@@ -178,10 +191,8 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     frequency,
                     initialPaymentAmount: formattedAmount, // CHARGE IMMEDIATELY
                     bankAccount: this.options_.bankAccountId,
-                    customerName: context?.customer?.first_name
-                        ? `${context.customer.first_name} ${context.customer.last_name || ""}`.trim()
-                        : "Customer",
-                    customerEmail: context?.customer?.email || "unknown@example.com",
+                    customerName: customerName || "Customer",
+                    customerEmail: customerEmail || "unknown@example.com",
                     notes: [{ text: `medusa_session:${sessionId}`, visibility: "private" }],
                 })
 
@@ -203,16 +214,15 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 }
             }
 
+
             // Standard Single Payment
             const response = await this.client_.createAndProcessPayment({
                 reference,
                 amount: formattedAmount,
                 bankAccount: this.options_.bankAccountId,
                 paymentMethod: this.options_.paymentMethod || FenaPaymentMethod.FenaOB,
-                customerName: context?.customer?.first_name
-                    ? `${context.customer.first_name} ${context.customer.last_name || ""}`.trim()
-                    : undefined,
-                customerEmail: context?.customer?.email ?? undefined,
+                customerName,
+                customerEmail,
                 customRedirectUrl: this.options_.redirectUrl
                     ? this.options_.redirectUrl.replace("{cart_id}", sessionId)
                     : undefined,
