@@ -158,36 +158,23 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
             const formattedAmount = Number(amount).toFixed(2)
 
-            let customerEmail = (context?.customer?.email || (context as any)?.email || (input.data as any)?.email) as string | undefined
-
-            if (!customerEmail && sessionId.startsWith("payses_")) {
-                try {
-                    const query = (this.container_ as any).resolve("query")
-                    const { data: sessions } = await query.graph({
-                        entity: "payment_session",
-                        fields: ["payment_collection.cart.email", "payment_collection.cart.customer.email"],
-                        filters: { id: sessionId }
-                    })
-
-                    const session = sessions[0]
-                    if (session?.payment_collection?.cart) {
-                        customerEmail = session.payment_collection.cart.email || session.payment_collection.cart.customer?.email
-                        this.logger_.info(`Fena: Recovered email from Cart Query: ${customerEmail || "still N/A"}`)
-                    }
-                } catch (err) {
-                    this.logger_.warn(`Fena: Failed to query Cart for email — ${err.message}`)
-                }
-            }
-
-            this.logger_.info(`Fena Debug — final customerEmail: ${customerEmail || "N/A"}`)
-
+            // Extract customer info: context.customer (logged-in) or input.data (guest)
+            let customerEmail = context?.customer?.email || (input.data as any)?.email
             const customerFirstName = context?.customer?.first_name || (input.data as any)?.first_name
             const customerLastName = context?.customer?.last_name || (input.data as any)?.last_name
-            const customerNameFallback = (input.data as any)?.customer_name || (input.data as any)?.name
+            const customerNameFromData = (input.data as any)?.customer_name || (input.data as any)?.name
+
+            // Secondary fallback: none. We strictly rely on data passed from the storefront/workflow.
+            // (Note: cross-module queries are restricted in v2 providers)
+            if (!customerEmail) {
+                this.logger_.warn(`Fena: No customer email provided for session: ${sessionId}`)
+            }
 
             const customerName = (customerFirstName
                 ? `${customerFirstName} ${customerLastName || ""}`.trim()
-                : customerNameFallback) as string | undefined
+                : customerNameFromData) as string | undefined
+
+            this.logger_.info(`Fena Debug — final customerEmail: ${customerEmail || "N/A"}, customerName: ${customerName || "N/A"}`)
 
             this.logger_.info(
                 `Fena: Creating ${isRecurring ? "recurring " : ""}payment for ${sessionId} — Email: ${customerEmail || "N/A"}, Name: ${customerName || "N/A"}`
