@@ -81,6 +81,7 @@ export type FenaPaymentProviderOptions = {
 
 type InjectedDependencies = {
     logger: Logger
+    [key: string]: any
 }
 
 // ────────────────────────────────────────────────────────
@@ -116,6 +117,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
     protected logger_: Logger
     protected options_: FenaPaymentProviderOptions
     protected client_: FenaClient
+    protected container_: InjectedDependencies
 
     constructor(
         container: InjectedDependencies,
@@ -125,6 +127,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
         this.logger_ = container.logger
         this.options_ = options
+        this.container_ = container
 
         // Initialize the Fena API client
         this.client_ = new FenaClient({
@@ -155,18 +158,35 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
             const formattedAmount = Number(amount).toFixed(2)
 
-            this.logger_.info(
-                `Fena: initiatePayment debug info — Input Data Keys: ${Object.keys(input.data || {}).join(", ")}, Context Keys: ${Object.keys(context || {}).join(", ")}`
-            )
-            this.logger_.info(`Fena Debug — context.email: ${(context as any)?.email}, context.customer.email: ${context?.customer?.email}, input.data.email: ${(input.data as any)?.email}`)
+            let customerEmail = (context?.customer?.email || (context as any)?.email || (input.data as any)?.email) as string | undefined
 
-            const customerEmail = (context?.customer?.email || (context as any)?.email || (input.data as any)?.email) as string | undefined
+            if (!customerEmail && sessionId.startsWith("payses_")) {
+                try {
+                    const query = (this.container_ as any).resolve("query")
+                    const { data: sessions } = await query.graph({
+                        entity: "payment_session",
+                        fields: ["payment_collection.cart.email", "payment_collection.cart.customer.email"],
+                        filters: { id: sessionId }
+                    })
+
+                    const session = sessions[0]
+                    if (session?.payment_collection?.cart) {
+                        customerEmail = session.payment_collection.cart.email || session.payment_collection.cart.customer?.email
+                        this.logger_.info(`Fena: Recovered email from Cart Query: ${customerEmail || "still N/A"}`)
+                    }
+                } catch (err) {
+                    this.logger_.warn(`Fena: Failed to query Cart for email — ${err.message}`)
+                }
+            }
+
+            this.logger_.info(`Fena Debug — final customerEmail: ${customerEmail || "N/A"}`)
+
             const customerFirstName = context?.customer?.first_name || (input.data as any)?.first_name
             const customerLastName = context?.customer?.last_name || (input.data as any)?.last_name
             const customerNameFallback = (input.data as any)?.customer_name || (input.data as any)?.name
 
-            const customerName = (customerFirstName 
-                ? `${customerFirstName} ${customerLastName || ""}`.trim() 
+            const customerName = (customerFirstName
+                ? `${customerFirstName} ${customerLastName || ""}`.trim()
                 : customerNameFallback) as string | undefined
 
             this.logger_.info(
