@@ -58,6 +58,7 @@ import {
     FenaRecurringPaymentFrequency,
     type FenaWebhookPayload,
     type FenaRecurringPayment,
+    type FenaPaymentNote,
 } from "../../lib/fena-client"
 
 // ────────────────────────────────────────────────────────
@@ -99,6 +100,25 @@ function getDataString(
     if (!data) return undefined
     const value = data[key]
     return typeof value === "string" ? value : undefined
+}
+
+/**
+ * Format a Medusa address into a single readable string for Fena notes.
+ */
+function formatAddress(address: any): string {
+    if (!address) return ""
+    const parts = [
+        address.first_name || address.last_name ? `${address.first_name || ""} ${address.last_name || ""}`.trim() : null,
+        address.company,
+        address.address_1,
+        address.address_2,
+        address.city,
+        address.province,
+        address.postal_code,
+        address.country_code?.toUpperCase(),
+        address.phone
+    ].filter(Boolean)
+    return parts.join(", ")
 }
 
 // ────────────────────────────────────────────────────────
@@ -195,6 +215,16 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 // Determine frequency and other recurring params from metadata or default
                 const frequency = (input.data?.frequency as FenaRecurringPaymentFrequency) || FenaRecurringPaymentFrequency.OneMonth
 
+                const shippingAddress = formatAddress((input.data as any)?.shipping_address)
+                const billingAddress = formatAddress((input.data as any)?.billing_address)
+
+                const notes = [
+                    { text: `medusa_session:${sessionId}`, visibility: "private" as const },
+                ]
+
+                if (shippingAddress) notes.push({ text: `Shipping: ${shippingAddress}`, visibility: "private" as const })
+                if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "private" as const })
+
                 const response = await this.client_.createAndProcessRecurringPayment({
                     reference,
                     recurringAmount: formattedAmount,
@@ -205,7 +235,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     bankAccount: this.options_.bankAccountId,
                     customerName: customerName || "Customer",
                     customerEmail: customerEmail || "unknown@example.com",
-                    notes: [{ text: `medusa_session:${sessionId}`, visibility: "private" }],
+                    notes,
                 })
 
                 const payment = response.result
@@ -227,6 +257,13 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             }
 
 
+            const shippingAddress = formatAddress((input.data as any)?.shipping_address)
+            const billingAddress = formatAddress((input.data as any)?.billing_address)
+
+            const notes: any[] = []
+            if (shippingAddress) notes.push({ text: `Shipping: ${shippingAddress}`, visibility: "private" })
+            if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "private" })
+
             // Standard Single Payment
             const response = await this.client_.createAndProcessPayment({
                 reference,
@@ -240,6 +277,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     : undefined,
                 // Embed full Medusa session ID in description so we can recover it in webhooks
                 description: `[medusa_session:${sessionId}] Order payment — ${currency_code.toUpperCase()}`,
+                notes,
             })
 
             const payment = response.result
