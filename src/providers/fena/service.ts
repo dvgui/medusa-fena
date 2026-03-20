@@ -261,8 +261,8 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const billingAddress = formatAddress((input.data as any)?.billing_address)
 
             const notes: any[] = []
-            if (shippingAddress) notes.push({ text: `Shipping: ${shippingAddress}`, visibility: "private" })
-            if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "private" })
+            if (shippingAddress) notes.push({ text: `Shipping: ${shippingAddress}`, visibility: "restricted" })
+            if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "restricted" })
 
             // Standard Single Payment
             const response = await this.client_.createAndProcessPayment({

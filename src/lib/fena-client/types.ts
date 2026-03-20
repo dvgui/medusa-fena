@@ -78,6 +78,7 @@ export interface FenaClientConfig {
 
 export interface FenaPaymentNote {
     text: string
+    visibility?: "public" | "restricted" | "private"
 }
 
 // ============================================================
@@ -272,7 +273,7 @@ export interface CreateRecurringPaymentInput {
     customerName: string
     customerEmail: string
     /** Optional notes */
-    notes?: Array<{ text: string; visibility: "public" | "private" }>
+    notes?: Array<{ text: string; visibility: "public" | "private" | "restricted" }>
 }
 
 export interface FenaRecurringPayment {
@@ -331,7 +332,7 @@ export interface FenaWebhookPayload {
     eventName?: string
     invoiceRefNumber?: string
     recurringAmount?: string
-    notes?: { text: string; visibility: "public" | "private" }[]
+    notes?: { text: string; visibility: "public" | "private" | "restricted" }[]
     /** Additional fields Fena may include */
     [key: string]: unknown
 }
