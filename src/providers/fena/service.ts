@@ -16,6 +16,7 @@ import {
     PaymentActions,
     MedusaError,
     BigNumber,
+    Modules,
 } from "@medusajs/framework/utils"
 import type { Logger } from "@medusajs/framework/types"
 import type {
@@ -637,6 +638,42 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             // Use the authentic status from the API instead of trusting the webhook payload
             let authenticStatus = webhookStatus
 
+            // ── Recurring-payment webhook events ──────────────────────
+            // Medusa's process-payment workflow requires a pre-existing
+            // payment session, which doesn't exist for standing-order
+            // renewals. We handle subscription side-effects here and
+            // ALWAYS return NOT_SUPPORTED so Medusa's built-in flow
+            // never runs (which would crash). Single-payment webhooks
+            // are completely unaffected — they skip this block.
+            const isRecurringEvent = webhookData.eventScope === "recurring-payments"
+
+            if (isRecurringEvent) {
+                this.logger_.info(
+                    `Fena webhook: recurring event "${webhookData.eventName}" for ${fenaPaymentId}`
+                )
+
+                // Handle subscription side-effects (safe — wrapped in try/catch)
+                try {
+                    await this.handleRecurringSubscriptionEvent(
+                        fenaPaymentId,
+                        webhookData.eventName || "",
+                        webhookData.status as string,
+                    )
+                } catch (err: any) {
+                    this.logger_.error(
+                        `Fena webhook: subscription handler error — ${err.message}`
+                    )
+                }
+
+                return {
+                    action: PaymentActions.NOT_SUPPORTED,
+                    data: {
+                        session_id: "",
+                        amount: new BigNumber(amount || 0),
+                    },
+                }
+            }
+
             try {
                 // Try Single Payment first
                 try {
@@ -653,19 +690,20 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     const recurring = await this.client_.getRecurringPayment(fenaPaymentId)
                     authenticStatus = recurring.status
 
-                    // Search in notes for medusa_session
-                    const sessionNote = recurring.transactions?.[0]?.notes?.find((n: any) => n.key === "medusa_session") ||
-                        (recurring as any).notes?.find((n: any) => n.key === "medusa_session")
+                    // Search in notes for medusa_session (stored as { text: "medusa_session:xxx" })
+                    const sessionNote = recurring.transactions?.[0]?.notes?.find((n: any) => n.text?.startsWith("medusa_session:")) ||
+                        (recurring as any).notes?.find((n: any) => n.text?.startsWith("medusa_session:"))
 
                     if (sessionNote) {
-                        sessionId = sessionNote.value
-                        this.logger_.info(`[v2.1] Fena webhook: recovered session_id from recurring notes: ${sessionId}`)
+                        const match = sessionNote.text.match(/medusa_session:(.+)/)
+                        sessionId = match?.[1] || ""
+                        this.logger_.info(`Fena webhook: recovered session_id from recurring notes: ${sessionId}`)
                     }
                 }
 
                 if (!sessionId) {
                     sessionId = reference || ""
-                    this.logger_.warn(`[v2.1] Fena webhook: no session_id found, using reference fallback: ${sessionId}`)
+                    this.logger_.warn(`Fena webhook: no session_id found, using reference fallback: ${sessionId}`)
                 }
             } catch (err: any) {
                 sessionId = reference || ""
@@ -750,6 +788,189 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     amount: new BigNumber(0),
                 },
             }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Recurring subscription event handler
+    // ──────────────────────────────────────────────────────
+
+    /**
+     * Handles recurring-payment webhook events for subscriptions
+     * managed via the cron renewal flow. Resolves Medusa services
+     * from the container to update subscription state.
+     *
+     * This method is safe to call from getWebhookActionAndData:
+     * - It only does simple CRUD (no order creation)
+     * - It's fully wrapped in try/catch by the caller
+     * - It never affects the return value (always NOT_SUPPORTED)
+     */
+    private async handleRecurringSubscriptionEvent(
+        fenaPaymentId: string,
+        eventName: string,
+        status: string,
+    ): Promise<void> {
+        // 1. Fetch recurring payment from Fena to get notes
+        let recurring: FenaRecurringPayment
+        try {
+            recurring = await this.client_.getRecurringPayment(fenaPaymentId)
+        } catch {
+            this.logger_.info(`Fena subscription handler: could not fetch recurring ${fenaPaymentId}, skipping`)
+            return
+        }
+
+        // 2. Find medusa_subscription:xxx note
+        const notes = recurring.notes || []
+        const subNote = notes.find((n) => n.text?.startsWith("medusa_subscription:"))
+        if (!subNote) {
+            this.logger_.info(`Fena subscription handler: no medusa_subscription note for ${fenaPaymentId}, skipping`)
+            return
+        }
+
+        const subscriptionId = subNote.text.replace("medusa_subscription:", "")
+        this.logger_.info(`Fena subscription handler: event="${eventName}" status="${status}" for subscription ${subscriptionId}`)
+
+        // 3. Resolve Medusa services from container
+        const subscriptionModule = this.container_["subscriptionModuleService"] as
+            | { updateSubscriptions: (data: Record<string, unknown>) => Promise<unknown> }
+            | undefined
+        const notificationModule = this.container_[Modules.NOTIFICATION] as
+            | { createNotifications: (data: Record<string, unknown>) => Promise<unknown> }
+            | undefined
+        const query = this.container_["query"] as
+            | { graph: (opts: Record<string, unknown>) => Promise<{ data: Record<string, unknown>[] }> }
+            | undefined
+
+        if (!subscriptionModule || !query) {
+            this.logger_.warn(`Fena subscription handler: subscription module or query not available, skipping`)
+            return
+        }
+
+        // 4. Fetch subscription
+        const { data: subs } = await query.graph({
+            entity: "subscription",
+            fields: ["id", "status", "metadata", "interval", "period", "subscription_date"],
+            filters: { id: subscriptionId },
+        })
+
+        interface SubscriptionRecord {
+            id: string
+            status: string
+            metadata: Record<string, string> | null
+            interval: string
+            period: number
+            subscription_date: string
+        }
+
+        const subscription = subs?.[0] as unknown as SubscriptionRecord | undefined
+        if (!subscription) {
+            this.logger_.warn(`Fena subscription handler: subscription ${subscriptionId} not found`)
+            return
+        }
+
+        const metadata = subscription.metadata || {}
+
+        // 5. Handle based on event
+        switch (eventName) {
+            case "status-update": {
+                const normalizedStatus = (status || "").toLowerCase()
+
+                if (normalizedStatus === "active") {
+                    // Standing order is now active — reactivate subscription
+                    // Set next_order_date to tomorrow so the cron picks it up
+                    const tomorrow = new Date()
+                    tomorrow.setDate(tomorrow.getDate() + 1)
+
+                    await subscriptionModule.updateSubscriptions({
+                        id: subscriptionId,
+                        status: "active",
+                        next_order_date: tomorrow,
+                        metadata: {
+                            ...metadata,
+                            fena_payment_id: metadata.fena_renewal_id || fenaPaymentId,
+                        },
+                    })
+
+                    this.logger_.info(
+                        `Fena subscription handler: reactivated subscription ${subscriptionId}, next_order_date=${tomorrow.toISOString().split("T")[0]}`
+                    )
+                } else {
+                    this.logger_.info(
+                        `Fena subscription handler: status-update to "${normalizedStatus}" for ${subscriptionId}, no action`
+                    )
+                }
+                break
+            }
+
+            case "payment_made": {
+                // Initial payment received (month 2). Order will be created by
+                // cron when next_order_date is reached (set by status-update handler).
+                this.logger_.info(
+                    `Fena subscription handler: payment_made for ${subscriptionId} — cron will create order`
+                )
+                break
+            }
+
+            case "payment-missed": {
+                // Standing order payment failed — send reminder email
+                const renewalLink = metadata.fena_renewal_link
+                if (!renewalLink) {
+                    this.logger_.warn(`Fena subscription handler: no renewal link for ${subscriptionId}, can't send reminder`)
+                    break
+                }
+
+                if (!notificationModule) {
+                    this.logger_.warn(`Fena subscription handler: notification module not available, can't send reminder`)
+                    break
+                }
+
+                // Fetch order data for email content
+                const originalOrderId = metadata.original_order_id
+                if (!originalOrderId) break
+
+                try {
+                    const { data: orders } = await query.graph({
+                        entity: "order",
+                        fields: ["id", "email", "customer.first_name", "customer.last_name", "items.*"],
+                        filters: { id: originalOrderId },
+                    })
+
+                    interface OrderRecord {
+                        id: string
+                        email: string
+                        customer?: { first_name?: string; last_name?: string }
+                        items?: Array<{ variant_id: string; title: string }>
+                    }
+
+                    const order = orders?.[0] as unknown as OrderRecord | undefined
+                    if (!order?.email) break
+
+                    const subItem = order.items?.find((i) => i.variant_id === metadata.variant_id)
+                    const customerName = [order.customer?.first_name, order.customer?.last_name]
+                        .filter(Boolean).join(" ") || "Customer"
+
+                    await notificationModule.createNotifications({
+                        to: order.email,
+                        channel: "email",
+                        template: "subscription-reminder",
+                        data: {
+                            customer_name: customerName,
+                            product_name: subItem?.title || "your product",
+                            renewal_amount: recurring.recurringAmount || "0.00",
+                            payment_url: renewalLink,
+                            subject: "Payment missed — please update your subscription",
+                        },
+                    })
+
+                    this.logger_.info(`Fena subscription handler: sent payment-missed reminder to ${order.email}`)
+                } catch (emailErr: unknown) {
+                    this.logger_.error(`Fena subscription handler: failed to send reminder — ${getErrorMessage(emailErr)}`)
+                }
+                break
+            }
+
+            default:
+                this.logger_.info(`Fena subscription handler: unhandled event "${eventName}" for ${subscriptionId}`)
         }
     }
 

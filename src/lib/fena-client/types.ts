@@ -284,13 +284,17 @@ export interface FenaRecurringPayment {
     finalPaymentDate?: string
     expectedNumberOfPayments: number
     frequency: FenaRecurringPaymentFrequency
-    status: "sent" | "active" | "cancelled" | "overdue"
+    status: "draft" | "sent" | "active" | "paid" | "rejected" | "warning" | "cancelled" | "overdue"
     transactions: any[]
+    initialPayment?: { id: string; amount: string; status: string } | null
     customerName?: string
     customerEmail?: string
     createdAt: string
     currency: string
+    link?: string
+    qrCodeData?: string
     bankAccount?: any
+    notes?: FenaPaymentNote[]
 }
 
 export interface FenaRecurringPaymentWithLink extends FenaRecurringPayment {
