@@ -264,18 +264,18 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 try {
                     await this.client_.attachRecurringPaymentNote(payment.id, {
                         text: `medusa_session:${sessionId}`,
-                        visibility: "private",
+                        visibility: "restricted",
                     })
                     if (shippingAddress) {
                         await this.client_.attachRecurringPaymentNote(payment.id, {
                             text: `Shipping: ${shippingAddress}`,
-                            visibility: "private",
+                            visibility: "restricted",
                         })
                     }
                     if (billingAddress) {
                         await this.client_.attachRecurringPaymentNote(payment.id, {
                             text: `Billing: ${billingAddress}`,
-                            visibility: "private",
+                            visibility: "restricted",
                         })
                     }
                 } catch (noteErr: unknown) {
