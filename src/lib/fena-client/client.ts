@@ -211,6 +211,23 @@ export class FenaClient {
         return res.deleted
     }
 
+    /**
+     * Attach a note to a recurring payment.
+     *
+     * `POST /payments/recurring/{id}/notes/attach`
+     */
+    async attachRecurringPaymentNote(
+        id: string,
+        note: { text: string; visibility: "public" | "private" | "restricted" }
+    ): Promise<FenaRecurringPayment> {
+        const res = await this.request<{ saved: boolean; result: FenaRecurringPayment }>(
+            "POST",
+            `/open/payments/recurring/${id}/notes/attach`,
+            note
+        )
+        return res.result
+    }
+
     // ────────────────────────────────────────────────────────
     // Managed Entities (Account Holders)
     // ────────────────────────────────────────────────────────

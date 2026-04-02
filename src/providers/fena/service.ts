@@ -202,29 +202,31 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             )
 
             if (isRecurring) {
-                // 1. Calculate 6-working-day delay (at least)
-                const startDate = new Date()
-                let addedDays = 0
-                while (addedDays < 6) {
-                    startDate.setDate(startDate.getDate() + 1)
-                    const day = startDate.getDay()
-                    if (day !== 0 && day !== 6) { // Skip Sunday(0) and Saturday(6)
-                        addedDays++
-                    }
-                }
-
-                // Determine frequency and other recurring params from metadata or default
+                // Determine frequency and period for recurring date calculation
                 const frequency = (input.data?.frequency as FenaRecurringPaymentFrequency) || FenaRecurringPaymentFrequency.OneMonth
+
+                // Calculate first standing order debit date = 1 cycle from now
+                // (customer pays month 1 via initialPaymentAmount, standing order starts month 2)
+                const startDate = new Date()
+                switch (frequency) {
+                    case FenaRecurringPaymentFrequency.OneWeek:
+                        startDate.setDate(startDate.getDate() + 7)
+                        break
+                    case FenaRecurringPaymentFrequency.OneMonth:
+                        startDate.setMonth(startDate.getMonth() + 1)
+                        break
+                    case FenaRecurringPaymentFrequency.ThreeMonths:
+                        startDate.setMonth(startDate.getMonth() + 3)
+                        break
+                    case FenaRecurringPaymentFrequency.OneYear:
+                        startDate.setFullYear(startDate.getFullYear() + 1)
+                        break
+                    default:
+                        startDate.setMonth(startDate.getMonth() + 1)
+                }
 
                 const shippingAddress = formatAddress((input.data as any)?.shipping_address)
                 const billingAddress = formatAddress((input.data as any)?.billing_address)
-
-                const notes = [
-                    { text: `medusa_session:${sessionId}`, visibility: "private" as const },
-                ]
-
-                if (shippingAddress) notes.push({ text: `Shipping: ${shippingAddress}`, visibility: "private" as const })
-                if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "private" as const })
 
                 const response = await this.client_.createAndProcessRecurringPayment({
                     reference,
@@ -236,10 +238,31 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     bankAccount: this.options_.bankAccountId,
                     customerName: customerName || "Customer",
                     customerEmail: customerEmail || "unknown@example.com",
-                    notes,
                 })
 
                 const payment = response.result
+
+                // Attach notes AFTER creation — create-and-process doesn't persist notes
+                try {
+                    await this.client_.attachRecurringPaymentNote(payment.id, {
+                        text: `medusa_session:${sessionId}`,
+                        visibility: "private",
+                    })
+                    if (shippingAddress) {
+                        await this.client_.attachRecurringPaymentNote(payment.id, {
+                            text: `Shipping: ${shippingAddress}`,
+                            visibility: "private",
+                        })
+                    }
+                    if (billingAddress) {
+                        await this.client_.attachRecurringPaymentNote(payment.id, {
+                            text: `Billing: ${billingAddress}`,
+                            visibility: "private",
+                        })
+                    }
+                } catch (noteErr: unknown) {
+                    this.logger_.warn(`Fena: Failed to attach notes to recurring ${payment.id}: ${getErrorMessage(noteErr)}`)
+                }
                 return {
                     id: payment.id,
                     data: {
