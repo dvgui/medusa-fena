@@ -827,8 +827,9 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             return
         }
 
-        const subscriptionId = subNote.text.replace("medusa_subscription:", "")
-        this.logger_.info(`Fena subscription handler: event="${eventName}" status="${status}" for subscription ${subscriptionId}`)
+        // Note format: "medusa_subscription:id1" or "medusa_subscription:id1,id2" (multiple subs from same order)
+        const subscriptionIds = subNote.text.replace("medusa_subscription:", "").split(",").filter(Boolean)
+        this.logger_.info(`Fena subscription handler: event="${eventName}" status="${status}" for subscriptions ${subscriptionIds.join(", ")}`)
 
         // 3. Resolve Medusa services from container
         const subscriptionModule = this.container_["subscriptionModuleService"] as
@@ -846,11 +847,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             return
         }
 
-        // 4. Fetch subscription
+        // 4. Fetch all subscriptions in the group
         const { data: subs } = await query.graph({
             entity: "subscription",
             fields: ["id", "status", "metadata", "interval", "period", "subscription_date"],
-            filters: { id: subscriptionId },
+            filters: { id: subscriptionIds },
         })
 
         interface SubscriptionRecord {
@@ -862,12 +863,14 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             subscription_date: string
         }
 
-        const subscription = subs?.[0] as unknown as SubscriptionRecord | undefined
-        if (!subscription) {
-            this.logger_.warn(`Fena subscription handler: subscription ${subscriptionId} not found`)
+        const subscriptions = (subs || []).map((s) => s as unknown as SubscriptionRecord)
+        if (subscriptions.length === 0) {
+            this.logger_.warn(`Fena subscription handler: no subscriptions found for IDs ${subscriptionIds.join(",")}`)
             return
         }
 
+        // Use first subscription for metadata (they all share the same order)
+        const subscription = subscriptions[0]
         const metadata = subscription.metadata || {}
 
         // 5. Handle based on event
@@ -876,37 +879,39 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 const normalizedStatus = (status || "").toLowerCase()
 
                 if (normalizedStatus === "active") {
-                    // Standing order is now active — reactivate subscription
-                    // Set next_order_date to tomorrow so the cron picks it up
+                    // Standing order is now active — reactivate ALL subscriptions in the group
                     const tomorrow = new Date()
                     tomorrow.setDate(tomorrow.getDate() + 1)
 
-                    await subscriptionModule.updateSubscriptions({
-                        id: subscriptionId,
-                        status: "active",
-                        next_order_date: tomorrow,
-                        metadata: {
-                            ...metadata,
-                            fena_payment_id: metadata.fena_renewal_id || fenaPaymentId,
-                        },
-                    })
+                    for (const sub of subscriptions) {
+                        const subMeta = sub.metadata || {}
+                        await subscriptionModule.updateSubscriptions({
+                            id: sub.id,
+                            status: "active",
+                            next_order_date: tomorrow,
+                            metadata: {
+                                ...subMeta,
+                                fena_payment_id: subMeta.fena_renewal_id || fenaPaymentId,
+                            },
+                        })
+                    }
 
                     this.logger_.info(
-                        `Fena subscription handler: reactivated subscription ${subscriptionId}, next_order_date=${tomorrow.toISOString().split("T")[0]}`
+                        `Fena subscription handler: reactivated ${subscriptions.length} subscriptions, next_order_date=${tomorrow.toISOString().split("T")[0]}`
                     )
                 } else {
                     this.logger_.info(
-                        `Fena subscription handler: status-update to "${normalizedStatus}" for ${subscriptionId}, no action`
+                        `Fena subscription handler: status-update to "${normalizedStatus}", no action`
                     )
                 }
                 break
             }
 
             case "payment_made": {
-                // Initial payment received (month 2). Order will be created by
-                // cron when next_order_date is reached (set by status-update handler).
+                // Initial payment received. Order will be created by cron
+                // when next_order_date is reached (set by status-update handler).
                 this.logger_.info(
-                    `Fena subscription handler: payment_made for ${subscriptionId} — cron will create order`
+                    `Fena subscription handler: payment_made for ${subscriptions.length} subscriptions — cron will create order`
                 )
                 break
             }
@@ -915,7 +920,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 // Standing order payment failed — send reminder email
                 const renewalLink = metadata.fena_renewal_link
                 if (!renewalLink) {
-                    this.logger_.warn(`Fena subscription handler: no renewal link for ${subscriptionId}, can't send reminder`)
+                    this.logger_.warn(`Fena subscription handler: no renewal link for ${subscriptionIds.join(",")}, can't send reminder`)
                     break
                 }
 
@@ -970,7 +975,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             }
 
             default:
-                this.logger_.info(`Fena subscription handler: unhandled event "${eventName}" for ${subscriptionId}`)
+                this.logger_.info(`Fena subscription handler: unhandled event "${eventName}" for ${subscriptionIds.join(",")}`)
         }
     }
 
