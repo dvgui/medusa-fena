@@ -225,6 +225,24 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         startDate.setMonth(startDate.getMonth() + 1)
                 }
 
+                // Fena requires the date to be a working day AND at least 6 working days out.
+                // If it falls on a weekend, advance to Monday.
+                const dayOfWeek = startDate.getDay()
+                if (dayOfWeek === 0) startDate.setDate(startDate.getDate() + 1) // Sunday → Monday
+                if (dayOfWeek === 6) startDate.setDate(startDate.getDate() + 2) // Saturday → Monday
+
+                // Ensure at least 6 working days from now
+                const minDate = new Date()
+                let workDays = 0
+                while (workDays < 6) {
+                    minDate.setDate(minDate.getDate() + 1)
+                    const d = minDate.getDay()
+                    if (d !== 0 && d !== 6) workDays++
+                }
+                if (startDate < minDate) {
+                    startDate.setTime(minDate.getTime())
+                }
+
                 const shippingAddress = formatAddress((input.data as any)?.shipping_address)
                 const billingAddress = formatAddress((input.data as any)?.billing_address)
 
