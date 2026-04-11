@@ -405,16 +405,21 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             const payment = await this.getPaymentOrRecurring(fenaPaymentId)
 
-            // Medusa's authorizePaymentSession only accepts "authorized" or "captured".
-            // Only return "authorized" when the bank has CONFIRMED payment.
-            // "sent" = just sent to bank, NOT confirmed — return "pending".
-            const fenaStatus = payment.status.toLowerCase()
+            // For recurring payments, Fena leaves the parent `status` at "sent" even after
+            // the initial charge has cleared at the bank — the truth lives in
+            // `initialPayment.status`. Treat a paid initial charge as authoritative so the
+            // Medusa session can authorize on first-signup. Singles don't have this field,
+            // so the optional chain is a no-op for the single-payment path.
+            const initialPaidOnRecurring =
+                (payment as FenaRecurringPayment).initialPayment?.status === "paid"
+            const effectiveStatus = initialPaidOnRecurring ? "paid" : payment.status
+            const fenaStatus = effectiveStatus.toLowerCase()
             const confirmedStatuses = ["paid", "active", "payment-made", "payment-confirmed"]
             const isConfirmed = confirmedStatuses.includes(fenaStatus)
             const isSent = fenaStatus === "sent" || fenaStatus === FenaPaymentStatus.Sent
 
             this.logger_.info(
-                `[v2.5] Fena: authorizePayment — ID: ${fenaPaymentId}, Fena status: ${payment.status}, confirmed: ${isConfirmed}, isSent: ${isSent}`
+                `[v2.5] Fena: authorizePayment — ID: ${fenaPaymentId}, Fena status: ${payment.status}, initialPaid: ${initialPaidOnRecurring}, confirmed: ${isConfirmed}, isSent: ${isSent}`
             )
 
             return {
@@ -455,8 +460,22 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         try {
             const payment = await this.getPaymentOrRecurring(fenaPaymentId)
 
-            if (payment.status === FenaPaymentStatus.Paid || payment.status === "active" || payment.status === "payment-made") {
-                this.logger_.info(`Fena: Payment ${fenaPaymentId} confirmed as captured/active`)
+            // Accept recurring.initialPayment.status === "paid" as capture confirmation —
+            // same reasoning as authorizePayment (Fena leaves the recurring parent at "sent"
+            // after the initial charge clears). Singles don't have initialPayment, so this
+            // is a strict addition that never fires on the single-payment path.
+            const initialPaidOnRecurring =
+                (payment as FenaRecurringPayment).initialPayment?.status === "paid"
+
+            if (
+                initialPaidOnRecurring ||
+                payment.status === FenaPaymentStatus.Paid ||
+                payment.status === "active" ||
+                payment.status === "payment-made"
+            ) {
+                this.logger_.info(
+                    `Fena: Payment ${fenaPaymentId} confirmed as captured/active (initialPaid: ${initialPaidOnRecurring})`
+                )
                 return {
                     data: {
                         ...input.data,
@@ -739,6 +758,48 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         const match = sessionNote.text.match(/medusa_session:(.+)/)
                         sessionId = match?.[1] || ""
                         this.logger_.info(`Fena webhook: recovered session_id from recurring notes: ${sessionId}`)
+                    }
+                }
+
+                if (!sessionId) {
+                    // Initial-charge of a new subscription fires on a Fena-auto-created
+                    // child single-payment that we can't tag at creation time (the recurring
+                    // endpoint doesn't return the child's id in any response). Reverse-lookup
+                    // Medusa's pending Fena sessions by fena_reference + amount as a safety
+                    // net. Only used when the description/note tag is missing, so singles
+                    // (which always carry the tag) never reach this code path.
+                    //
+                    // The matching session is always brand-new at this point (seconds-to-minutes
+                    // old, freshly created during the customer's checkout), so sorting pending
+                    // sessions by created_at DESC puts our target at the top of the result set.
+                    // A small take value is enough — we just need to see the newest first.
+                    try {
+                        const paymentModule: any = this.container_.resolve(Modules.PAYMENT)
+                        const pendingSessions: any[] = await paymentModule.listPaymentSessions(
+                            { status: "pending" },
+                            { take: 50, order: { created_at: "DESC" } }
+                        )
+                        const webhookAmount = Number(amount || 0)
+                        const match = pendingSessions.find(
+                            (s) =>
+                                s.provider_id?.toLowerCase().includes("fena") &&
+                                s.data?.fena_reference === reference &&
+                                Number(s.amount) === webhookAmount
+                        )
+                        if (match?.id) {
+                            sessionId = match.id
+                            this.logger_.info(
+                                `Fena webhook: recovered session_id via reverse lookup (fena_reference=${reference}, amount=${webhookAmount}): ${sessionId} (scanned ${pendingSessions.length} pending)`
+                            )
+                        } else {
+                            this.logger_.warn(
+                                `Fena webhook: reverse lookup found no match (ref=${reference}, amount=${webhookAmount}, scanned ${pendingSessions.length} pending)`
+                            )
+                        }
+                    } catch (lookupErr: any) {
+                        this.logger_.warn(
+                            `Fena webhook: reverse lookup failed — ${lookupErr.message}`
+                        )
                     }
                 }
 
