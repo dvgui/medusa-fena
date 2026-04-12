@@ -774,8 +774,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     // sessions by created_at DESC puts our target at the top of the result set.
                     // A small take value is enough — we just need to see the newest first.
                     try {
-                        const paymentModule: any = this.container_.resolve(Modules.PAYMENT)
-                        const pendingSessions: any[] = await paymentModule.listPaymentSessions(
+                        const paymentSessionService: any = this.container_["paymentSessionService"]
+                        if (!paymentSessionService) {
+                            throw new Error("paymentSessionService not available in provider container")
+                        }
+                        const pendingSessions: any[] = await paymentSessionService.list(
                             { status: "pending" },
                             { take: 50, order: { created_at: "DESC" } }
                         )
