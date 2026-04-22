@@ -79,6 +79,13 @@ export type FenaPaymentProviderOptions = {
     redirectUrl?: string
     /** Webhook URL for Fena to send payment status updates */
     webhookUrl?: string
+    /**
+     * Customer-facing store name shown on the Fena payment page and in the
+     * customer's bank app, e.g. "Acme Co". The plugin formats the description
+     * as `${storeName} order — ref ${reference}` (or just
+     * `Order — ref ${reference}` if unset). Keep it short — ideally < 40 chars.
+     */
+    storeName?: string
 }
 
 type InjectedDependencies = {
@@ -303,8 +310,22 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const billingAddress = formatAddress((input.data as any)?.billing_address)
 
             const notes: any[] = []
+            // Restricted (merchant-only) note carrying the Medusa session id so
+            // webhooks can route back to the right payment_session. Restricted
+            // visibility means the customer never sees this in the bank app.
+            // Mirrors the pattern recurring payments already use.
+            notes.push({ text: `medusa_session:${sessionId}`, visibility: "restricted" })
             if (shippingAddress) notes.push({ text: `Shipping: ${shippingAddress}`, visibility: "restricted" })
             if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "restricted" })
+
+            // Customer-facing description shown on the Fena page + bank app.
+            // Generic by default; merchants can supply `storeName` in provider
+            // options for a branded prefix. The traceable session id lives in
+            // the restricted note above, not in the description.
+            const storeName = this.options_.storeName?.trim()
+            const description = storeName
+                ? `${storeName} order — ref ${reference}`
+                : `Order — ref ${reference}`
 
             // Standard Single Payment
             const response = await this.client_.createAndProcessPayment({
@@ -317,8 +338,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 customRedirectUrl: this.options_.redirectUrl
                     ? this.options_.redirectUrl.replace("{cart_id}", sessionId)
                     : undefined,
-                // Embed full Medusa session ID in description so we can recover it in webhooks
-                description: `[medusa_session:${sessionId}] Order payment — ${currency_code.toUpperCase()}`,
+                description,
                 notes,
             })
 
@@ -740,10 +760,31 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     const payment = await this.client_.getPayment(fenaPaymentId)
                     authenticStatus = payment.status
 
-                    const descMatch = payment.description?.match(/\[medusa_session:([^\]]+)\]/)
-                    if (descMatch) {
-                        sessionId = descMatch[1]
-                        this.logger_.info(`Fena webhook: recovered session_id from description: ${sessionId}`)
+                    // Prefer the restricted `medusa_session:` note (new
+                    // payments). Fall back to the legacy description regex
+                    // for in-flight payments created before the cleanup.
+                    const noteSession = (payment as any).notes?.find?.(
+                        (n: any) =>
+                            typeof n?.text === "string" &&
+                            n.text.startsWith("medusa_session:")
+                    )
+                    if (noteSession) {
+                        sessionId = String(noteSession.text).slice(
+                            "medusa_session:".length
+                        )
+                        this.logger_.info(
+                            `Fena webhook: recovered session_id from note: ${sessionId}`
+                        )
+                    } else {
+                        const descMatch = payment.description?.match(
+                            /\[medusa_session:([^\]]+)\]/
+                        )
+                        if (descMatch) {
+                            sessionId = descMatch[1]
+                            this.logger_.info(
+                                `Fena webhook: recovered session_id from description (legacy): ${sessionId}`
+                            )
+                        }
                     }
                 } catch (e) {
                     // Try Recurring Payment
