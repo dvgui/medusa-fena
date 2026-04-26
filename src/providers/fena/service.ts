@@ -643,11 +643,16 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             `Fena: updatePayment — ID: ${getDataString(input.data, "fena_payment_id") ?? "unknown"}, amount: ${amount}`
         )
 
+        // Medusa calls updatePayment for status-only changes (e.g.
+        // "canceled") and during createPaymentSession reconciliation,
+        // both of which omit amount/currency_code. Don't overwrite the
+        // existing data with undefined — the entity's amount column is
+        // NOT NULL and would otherwise throw.
         return {
             data: {
                 ...input.data,
-                amount: amount?.toString(),
-                currency_code,
+                ...(amount !== undefined ? { amount: amount.toString() } : {}),
+                ...(currency_code !== undefined ? { currency_code } : {}),
             },
         }
     }
