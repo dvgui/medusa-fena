@@ -875,11 +875,29 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 case "payment-made":
                 case "payment-confirmed":
                 case "paid":
-                case FenaPaymentStatus.Paid:
+                case FenaPaymentStatus.Paid: {
+                    // Orphan-paid recovery: a paid webhook that points
+                    // at a missing/canceled Medusa session would crash
+                    // core's authorize step. Emit an app-handled event
+                    // and return NOT_SUPPORTED so core skips its flow.
+                    const orphanEmitted = await this.maybeEmitFenaOrphanPaid({
+                        sessionId,
+                        fenaPaymentId,
+                        fenaReference: reference || "",
+                        amount: Number(amount || 0),
+                        currencyCode: webhookData.currency || "GBP",
+                    })
+                    if (orphanEmitted) {
+                        return {
+                            action: PaymentActions.NOT_SUPPORTED,
+                            data: payloadData,
+                        }
+                    }
                     return {
                         action: PaymentActions.SUCCESSFUL,
                         data: payloadData,
                     }
+                }
 
                 case "sent":
                 case FenaPaymentStatus.Sent:
@@ -1127,6 +1145,135 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             default:
                 this.logger_.info(`Fena subscription handler: unhandled event "${eventName}" for ${subscriptionIds.join(",")}`)
+        }
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Orphan-paid event emit
+    // ──────────────────────────────────────────────────────
+
+    /**
+     * If a paid webhook references a payment_session that is missing,
+     * canceled, or soft-deleted in Medusa, emit `payment.fena_orphan_paid`
+     * so the host app's recovery workflow can take over.
+     *
+     * Returns `true` when an orphan was detected and the event emitted —
+     * the caller should return NOT_SUPPORTED so Medusa core does not try
+     * (and fail) to authorize the missing session.
+     *
+     * Returns `false` for healthy sessions (caller proceeds with
+     * SUCCESSFUL) and on any unexpected error (caller proceeds; we never
+     * want orphan-detection to mask legitimate paid webhooks).
+     */
+    private async maybeEmitFenaOrphanPaid(args: {
+        sessionId: string
+        fenaPaymentId: string
+        fenaReference: string
+        amount: number
+        currencyCode: string
+    }): Promise<boolean> {
+        try {
+            const query = this.container_["query"] as
+                | {
+                      graph: (opts: Record<string, unknown>) => Promise<{
+                          data: Array<{
+                              id: string
+                              status?: string | null
+                              deleted_at?: string | Date | null
+                          }>
+                      }>
+                  }
+                | undefined
+            if (!query) {
+                this.logger_.warn(
+                    `Fena orphan-check: query not available, skipping for session ${args.sessionId}`,
+                )
+                return false
+            }
+
+            const { data: sessions } = await query.graph({
+                entity: "payment_session",
+                fields: ["id", "status", "deleted_at"],
+                filters: { id: args.sessionId },
+            })
+            const session = sessions?.[0]
+            const isOrphan =
+                !session ||
+                session.deleted_at != null ||
+                session.status === "canceled"
+
+            if (!session) {
+                this.logger_.warn(
+                    `Fena orphan-check: session ${args.sessionId} missing — treating fena_payment_id ${args.fenaPaymentId} as orphan-paid`,
+                )
+            } else if (isOrphan) {
+                this.logger_.warn(
+                    `Fena orphan-check: session ${args.sessionId} status=${session.status} deleted_at=${session.deleted_at} — treating fena_payment_id ${args.fenaPaymentId} as orphan-paid`,
+                )
+            }
+
+            if (!isOrphan) {
+                return false
+            }
+
+            // Fetch the Fena payment to get customer email/name and the
+            // canonical timestamp. Best-effort — if the API call fails we
+            // still emit with what we have so the recovery workflow can
+            // try to match the cart by reference + amount.
+            let customerEmail = ""
+            let customerName: string | undefined
+            let capturedAtIso = new Date().toISOString()
+            try {
+                const fenaPayment =
+                    await this.client_.getPayment(args.fenaPaymentId)
+                customerEmail = fenaPayment.customerEmail || ""
+                customerName = fenaPayment.customerName
+                capturedAtIso = fenaPayment.createdAt
+                    ? new Date(fenaPayment.createdAt).toISOString()
+                    : capturedAtIso
+            } catch (e) {
+                this.logger_.warn(
+                    `Fena orphan-check: getPayment(${args.fenaPaymentId}) failed — ${getErrorMessage(e)}. Emitting with empty customerEmail.`,
+                )
+            }
+
+            const eventBus = this.container_[Modules.EVENT_BUS] as
+                | {
+                      emit: (input: {
+                          name: string
+                          data: Record<string, unknown>
+                      }) => Promise<unknown>
+                  }
+                | undefined
+            if (!eventBus) {
+                this.logger_.error(
+                    `Fena orphan-check: event bus not available — cannot emit payment.fena_orphan_paid for ${args.fenaPaymentId}`,
+                )
+                return false
+            }
+
+            await eventBus.emit({
+                name: "payment.fena_orphan_paid",
+                data: {
+                    fenaPaymentId: args.fenaPaymentId,
+                    fenaReference: args.fenaReference,
+                    amount: args.amount,
+                    currencyCode: args.currencyCode,
+                    customerEmail,
+                    customerName,
+                    capturedAtIso,
+                    missingSessionId: args.sessionId,
+                },
+            })
+            this.logger_.info(
+                `Fena orphan-check: emitted payment.fena_orphan_paid for ${args.fenaPaymentId} (ref=${args.fenaReference}, email=${customerEmail || "unknown"})`,
+            )
+            return true
+        } catch (e) {
+            this.logger_.error(
+                `Fena orphan-check: unexpected error — ${getErrorMessage(e)}. Falling through to SUCCESSFUL.`,
+            )
+            return false
         }
     }
 
