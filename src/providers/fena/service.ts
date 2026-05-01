@@ -98,6 +98,28 @@ type InjectedDependencies = {
 // ────────────────────────────────────────────────────────
 
 /**
+ * Resolve a key from an Awilix-style container without throwing on miss.
+ * Awilix `cradle` proxies throw `AwilixResolutionError` for unregistered
+ * keys, so a plain `container[key]` access can blow up the caller. We try
+ * a list of candidate keys and return the first registered value, or
+ * `undefined` if none resolve. Callers must still null-check the result.
+ */
+const safeResolve = <T>(
+    container: Record<string, unknown>,
+    keys: readonly string[],
+): T | undefined => {
+    for (const key of keys) {
+        try {
+            const value = container[key]
+            if (value != null) return value as T
+        } catch {
+            // unregistered key — try next
+        }
+    }
+    return undefined
+}
+
+/**
  * Safely extracts a string from payment session `data` by key.
  * Returns `undefined` if the key doesn't exist or isn't a string.
  */
@@ -1001,15 +1023,15 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         this.logger_.info(`Fena subscription handler: event="${eventName}" status="${status}" for subscriptions ${subscriptionIds.join(", ")}`)
 
         // 3. Resolve Medusa services from container
-        const subscriptionModule = this.container_["subscriptionModuleService"] as
-            | { updateSubscriptions: (data: Record<string, unknown>) => Promise<unknown> }
-            | undefined
-        const notificationModule = this.container_[Modules.NOTIFICATION] as
-            | { createNotifications: (data: Record<string, unknown>) => Promise<unknown> }
-            | undefined
-        const query = this.container_["query"] as
-            | { graph: (opts: Record<string, unknown>) => Promise<{ data: Record<string, unknown>[] }> }
-            | undefined
+        const subscriptionModule = safeResolve<{
+            updateSubscriptions: (data: Record<string, unknown>) => Promise<unknown>
+        }>(this.container_, ["subscriptionModuleService"])
+        const notificationModule = safeResolve<{
+            createNotifications: (data: Record<string, unknown>) => Promise<unknown>
+        }>(this.container_, [Modules.NOTIFICATION])
+        const query = safeResolve<{
+            graph: (opts: Record<string, unknown>) => Promise<{ data: Record<string, unknown>[] }>
+        }>(this.container_, ["query", "__query__", "remoteQuery"])
 
         if (!subscriptionModule || !query) {
             this.logger_.warn(`Fena subscription handler: subscription module or query not available, skipping`)
@@ -1173,20 +1195,22 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         currencyCode: string
     }): Promise<boolean> {
         try {
-            const query = this.container_["query"] as
-                | {
-                      graph: (opts: Record<string, unknown>) => Promise<{
-                          data: Array<{
-                              id: string
-                              status?: string | null
-                              deleted_at?: string | Date | null
-                          }>
-                      }>
-                  }
-                | undefined
+            type QueryService = {
+                graph: (opts: Record<string, unknown>) => Promise<{
+                    data: Array<{
+                        id: string
+                        status?: string | null
+                        deleted_at?: string | Date | null
+                    }>
+                }>
+            }
+            const query = safeResolve<QueryService>(
+                this.container_,
+                ["query", "__query__", "remoteQuery"],
+            )
             if (!query) {
                 this.logger_.warn(
-                    `Fena orphan-check: query not available, skipping for session ${args.sessionId}`,
+                    `Fena orphan-check: query not registered in payment-provider scope; skipping detection for session ${args.sessionId}. Recovery script remains available.`,
                 )
                 return false
             }
@@ -1237,14 +1261,16 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 )
             }
 
-            const eventBus = this.container_[Modules.EVENT_BUS] as
-                | {
-                      emit: (input: {
-                          name: string
-                          data: Record<string, unknown>
-                      }) => Promise<unknown>
-                  }
-                | undefined
+            type EventBusService = {
+                emit: (input: {
+                    name: string
+                    data: Record<string, unknown>
+                }) => Promise<unknown>
+            }
+            const eventBus = safeResolve<EventBusService>(
+                this.container_,
+                [Modules.EVENT_BUS, "eventBusService", "__event_bus__"],
+            )
             if (!eventBus) {
                 this.logger_.error(
                     `Fena orphan-check: event bus not available — cannot emit payment.fena_orphan_paid for ${args.fenaPaymentId}`,
