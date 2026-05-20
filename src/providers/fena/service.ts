@@ -1099,11 +1099,67 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             }
 
             case "payment_made": {
-                // Initial payment received. Order will be created by cron
-                // when next_order_date is reached (set by status-update handler).
-                this.logger_.info(
-                    `Fena subscription handler: payment_made for ${subscriptions.length} subscriptions — cron will create order`
+                // The customer's bank just auto-debited a cycle (initial or
+                // renewal). Emit subscription.fena_renewal_paid so the host
+                // app decides whether to record a passive renewal order;
+                // we deliberately don't run renewal logic in the plugin.
+                const txns = (recurring.transactions || []) as Array<{
+                    id?: string
+                    amount?: string
+                    completedAt?: string
+                    createdAt?: string
+                }>
+                const latestTxn = txns.length
+                    ? txns
+                          .slice()
+                          .sort((a, b) => {
+                              const at = new Date(a.completedAt || a.createdAt || 0).getTime()
+                              const bt = new Date(b.completedAt || b.createdAt || 0).getTime()
+                              return bt - at
+                          })[0]
+                    : undefined
+
+                const eventBus = safeResolve<{
+                    emit: (input: {
+                        name: string
+                        data: Record<string, unknown>
+                    }) => Promise<unknown>
+                }>(
+                    this.container_,
+                    [Modules.EVENT_BUS, "eventBusService", "__event_bus__"]
                 )
+
+                if (!eventBus) {
+                    this.logger_.warn(
+                        `Fena subscription handler: event bus not available — can't emit subscription.fena_renewal_paid for ${fenaPaymentId}`
+                    )
+                    break
+                }
+
+                const amountStr = latestTxn?.amount || recurring.recurringAmount || "0"
+                const paidAtIso = latestTxn?.completedAt
+                    || latestTxn?.createdAt
+                    || new Date().toISOString()
+
+                try {
+                    await eventBus.emit({
+                        name: "subscription.fena_renewal_paid",
+                        data: {
+                            subscription_ids: subscriptionIds,
+                            fena_payment_id: fenaPaymentId,
+                            fena_transaction_id: latestTxn?.id,
+                            amount: Number(amountStr),
+                            paid_at_iso: paidAtIso,
+                        },
+                    })
+                    this.logger_.info(
+                        `Fena subscription handler: emitted subscription.fena_renewal_paid for subs [${subscriptionIds.join(",")}] (txn=${latestTxn?.id ?? "n/a"}, amount=${amountStr})`
+                    )
+                } catch (emitErr: unknown) {
+                    this.logger_.error(
+                        `Fena subscription handler: emit failed for ${fenaPaymentId} — ${getErrorMessage(emitErr)}`
+                    )
+                }
                 break
             }
 
