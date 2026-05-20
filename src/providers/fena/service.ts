@@ -203,6 +203,36 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         const { amount, currency_code, context } = input
 
         try {
+            // Passive sessions record an already-cleared bank-side debit
+            // (e.g. cycle N of a standing order whose payment_made webhook
+            // we just received). No new Fena charge needed — return a stub
+            // session that references the existing fena_payment_id so the
+            // subsequent authorizePayment passive-branch can short-circuit
+            // straight to status=captured.
+            if (input.data?.is_passive) {
+                const existingFenaId =
+                    getDataString(input.data, "fena_payment_id") ||
+                    getDataString(input.data, "fena_recurring_id")
+                if (!existingFenaId) {
+                    throw new MedusaError(
+                        MedusaError.Types.INVALID_DATA,
+                        "Fena passive session requires fena_payment_id in input.data"
+                    )
+                }
+                this.logger_.info(
+                    `Fena: passive session (no new payment created) — referencing existing ${existingFenaId}`
+                )
+                return {
+                    id: existingFenaId,
+                    data: {
+                        ...input.data,
+                        fena_payment_id: existingFenaId,
+                        is_passive: true,
+                        currency_code,
+                    },
+                }
+            }
+
             const isRecurring = !!input.data?.is_recurring
             const sessionId = getDataString(input.data, "session_id") ?? `cart_${Date.now()}`
             const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
@@ -1099,25 +1129,28 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             }
 
             case "payment_made": {
-                // The customer's bank just auto-debited a cycle (initial or
-                // renewal). Emit subscription.fena_renewal_paid so the host
-                // app decides whether to record a passive renewal order;
-                // we deliberately don't run renewal logic in the plugin.
+                // payment_made fires on transaction CREATION at the bank,
+                // not on completion — Fena pre-queues the next cycle as a
+                // pending transaction the moment the previous one clears
+                // (so noon-ish "payment_made" webhooks are routinely about
+                // the NEXT cycle, not the one that just settled).
+                //
+                // Treat this event as a wake-up signal: re-scan the
+                // recurring's transactions and emit one
+                // subscription.fena_renewal_paid event per transaction whose
+                // status === "completed". The subscriber's
+                // fena_renewal_handled_txns set provides idempotency, so
+                // re-emitting for already-handled txns is safe.
                 const txns = (recurring.transactions || []) as Array<{
                     id?: string
+                    status?: string
                     amount?: string
                     completedAt?: string
                     createdAt?: string
                 }>
-                const latestTxn = txns.length
-                    ? txns
-                          .slice()
-                          .sort((a, b) => {
-                              const at = new Date(a.completedAt || a.createdAt || 0).getTime()
-                              const bt = new Date(b.completedAt || b.createdAt || 0).getTime()
-                              return bt - at
-                          })[0]
-                    : undefined
+                const completedTxns = txns.filter(
+                    (t) => (t.status || "").toLowerCase() === "completed" && t.id
+                )
 
                 const eventBus = safeResolve<{
                     emit: (input: {
@@ -1136,29 +1169,39 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     break
                 }
 
-                const amountStr = latestTxn?.amount || recurring.recurringAmount || "0"
-                const paidAtIso = latestTxn?.completedAt
-                    || latestTxn?.createdAt
-                    || new Date().toISOString()
-
-                try {
-                    await eventBus.emit({
-                        name: "subscription.fena_renewal_paid",
-                        data: {
-                            subscription_ids: subscriptionIds,
-                            fena_payment_id: fenaPaymentId,
-                            fena_transaction_id: latestTxn?.id,
-                            amount: Number(amountStr),
-                            paid_at_iso: paidAtIso,
-                        },
-                    })
+                if (completedTxns.length === 0) {
                     this.logger_.info(
-                        `Fena subscription handler: emitted subscription.fena_renewal_paid for subs [${subscriptionIds.join(",")}] (txn=${latestTxn?.id ?? "n/a"}, amount=${amountStr})`
+                        `Fena subscription handler: payment_made for ${fenaPaymentId} but no completed transactions yet (have ${txns.length} txn(s) with statuses [${txns.map((t) => t.status).join(",")}]). Subscriber will retry when a transaction completes.`
                     )
-                } catch (emitErr: unknown) {
-                    this.logger_.error(
-                        `Fena subscription handler: emit failed for ${fenaPaymentId} — ${getErrorMessage(emitErr)}`
-                    )
+                    break
+                }
+
+                this.logger_.info(
+                    `Fena subscription handler: ${completedTxns.length} completed transaction(s) on ${fenaPaymentId} — emitting per-txn events`
+                )
+
+                for (const txn of completedTxns) {
+                    const amountStr = txn.amount || recurring.recurringAmount || "0"
+                    const paidAtIso = txn.completedAt || txn.createdAt || new Date().toISOString()
+                    try {
+                        await eventBus.emit({
+                            name: "subscription.fena_renewal_paid",
+                            data: {
+                                subscription_ids: subscriptionIds,
+                                fena_payment_id: fenaPaymentId,
+                                fena_transaction_id: txn.id,
+                                amount: Number(amountStr),
+                                paid_at_iso: paidAtIso,
+                            },
+                        })
+                        this.logger_.info(
+                            `Fena subscription handler: emitted subscription.fena_renewal_paid for subs [${subscriptionIds.join(",")}] (txn=${txn.id}, amount=${amountStr})`
+                        )
+                    } catch (emitErr: unknown) {
+                        this.logger_.error(
+                            `Fena subscription handler: emit failed for txn ${txn.id} — ${getErrorMessage(emitErr)}`
+                        )
+                    }
                 }
                 break
             }
