@@ -66,10 +66,27 @@ import {
 // Provider options — configured in medusa-config.ts
 // ────────────────────────────────────────────────────────
 
-export type FenaPaymentProviderOptions = {
-    /** Fena Integration ID (terminal-id) */
+/**
+ * Per-brand credential override. When the resolver picks a brand at request
+ * time, all FenaClient calls (initiate / authorize / capture / webhook
+ * lookups) use this set instead of the top-level default. Each brand can
+ * also carry its own bankAccountId and storeName so the customer-facing
+ * description on the bank app says "BUYELORA order — …" instead of the
+ * default merchant label.
+ */
+export type FenaBrandCredentials = {
     terminalId: string
-    /** Fena Integration Secret (terminal-secret) — UUID */
+    terminalSecret: string
+    bankAccountId?: string
+    storeName?: string
+    redirectUrl?: string
+}
+
+export type FenaPaymentProviderOptions = {
+    /** Fena Integration ID (terminal-id) — DEFAULT credentials, used when
+     *  no brand override matches. UK / TG fall through to this set. */
+    terminalId: string
+    /** Fena Integration Secret (terminal-secret) — UUID. Default set. */
     terminalSecret: string
     /** Bank account ID to receive payments. Uses Fena default if omitted. */
     bankAccountId?: string
@@ -86,6 +103,16 @@ export type FenaPaymentProviderOptions = {
      * `Order — ref ${reference}` if unset). Keep it short — ideally < 40 chars.
      */
     storeName?: string
+    /**
+     * Per-brand credential overrides keyed by storefront slug (matching
+     * cart.metadata.storefront stamped by the storefront on cart creation).
+     * The provider resolves the brand at payment time and routes Fena API
+     * calls to the right merchant set. Unlisted slugs fall through to the
+     * top-level (default) credentials, so adding a brand here is purely
+     * additive and never breaks existing brands. See the constructor for
+     * the resolution rules.
+     */
+    brandCredentials?: Record<string, FenaBrandCredentials>
 }
 
 type InjectedDependencies = {
@@ -161,6 +188,19 @@ export const FENA_PROVIDER_ID = "fena-ob"
 // Provider Service
 // ────────────────────────────────────────────────────────
 
+/** Sentinel slug key for the top-level (default) credential set. */
+const DEFAULT_BRAND_SLUG = "__default__"
+
+/** Effective per-brand merchant context: pre-built client + the merged
+ *  options for that brand (bankAccountId / storeName / redirectUrl etc.
+ *  fall back to the top-level defaults when the brand entry omits them). */
+type BrandContext = {
+    client: FenaClient
+    opts: FenaPaymentProviderOptions
+    /** Brand slug this context belongs to, or DEFAULT_BRAND_SLUG. */
+    slug: string
+}
+
 class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProviderOptions> {
     static identifier = FENA_PROVIDER_ID
 
@@ -168,6 +208,12 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
     protected options_: FenaPaymentProviderOptions
     protected client_: FenaClient
     protected container_: InjectedDependencies
+
+    /** Per-slug merchant context. Always contains DEFAULT_BRAND_SLUG; brand
+     *  overrides from options.brandCredentials are added on top. Iteration
+     *  order matters for webhook reverse-lookup (we try the default last so
+     *  brand merchants get first crack at unknown payment ids). */
+    private brandContexts_: Map<string, BrandContext>
 
     constructor(
         container: InjectedDependencies,
@@ -179,13 +225,158 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         this.options_ = options
         this.container_ = container
 
-        // Initialize the Fena API client
-        this.client_ = new FenaClient({
+        // Default merchant (UK + TG today). Always present so a brand-less
+        // request — or a brand the operator hasn't onboarded yet — still
+        // routes to a working Fena terminal.
+        const defaultClient = new FenaClient({
             terminalId: options.terminalId,
             terminalSecret: options.terminalSecret,
         })
+        this.client_ = defaultClient
+        this.brandContexts_ = new Map()
 
-        this.logger_.info("Fena Payment Provider initialized")
+        // Per-brand overrides. Each entry inherits non-credential fields
+        // (paymentMethod, webhookUrl) from the top-level options so the
+        // brand config only carries the bits that actually differ.
+        const overrides = options.brandCredentials ?? {}
+        for (const [slug, creds] of Object.entries(overrides)) {
+            if (!creds.terminalId || !creds.terminalSecret) {
+                this.logger_.warn(
+                    `Fena: brandCredentials[${slug}] missing terminalId/terminalSecret — skipping override (slug will fall through to default credentials)`
+                )
+                continue
+            }
+            this.brandContexts_.set(slug, {
+                client: new FenaClient({
+                    terminalId: creds.terminalId,
+                    terminalSecret: creds.terminalSecret,
+                }),
+                opts: {
+                    ...options,
+                    terminalId: creds.terminalId,
+                    terminalSecret: creds.terminalSecret,
+                    bankAccountId: creds.bankAccountId ?? options.bankAccountId,
+                    storeName: creds.storeName ?? options.storeName,
+                    redirectUrl: creds.redirectUrl ?? options.redirectUrl,
+                },
+                slug,
+            })
+        }
+        // Default goes LAST in iteration order so webhook reverse-lookup
+        // gives brand merchants first dibs on a Fena payment id.
+        this.brandContexts_.set(DEFAULT_BRAND_SLUG, {
+            client: defaultClient,
+            opts: options,
+            slug: DEFAULT_BRAND_SLUG,
+        })
+
+        const overrideCount = this.brandContexts_.size - 1
+        this.logger_.info(
+            overrideCount > 0
+                ? `Fena Payment Provider initialized with ${overrideCount} brand override(s): ${[...this.brandContexts_.keys()].filter((s) => s !== DEFAULT_BRAND_SLUG).join(", ")}`
+                : "Fena Payment Provider initialized (single-tenant)"
+        )
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Brand resolution helpers
+    // ──────────────────────────────────────────────────────
+
+    /**
+     * Resolve which merchant (BrandContext) should handle a storefront-
+     * initiated payment flow. Tries, in order:
+     *   1. Explicit `brand_slug` stamped into input.data (we stamp this in
+     *      initiatePayment so authorize/capture/etc. avoid a cart lookup).
+     *   2. `session_id` (cart_id) → cart.metadata.storefront via the cart
+     *      module. Cheap on first hit and the brand slug carries forward
+     *      via #1 for the rest of the lifecycle.
+     *   3. Default (top-level credentials).
+     *
+     * Never throws — falls through to the default merchant on any failure.
+     */
+    protected async resolveContext(input: {
+        data?: Record<string, unknown>
+    }): Promise<BrandContext> {
+        const explicit =
+            typeof input.data?.brand_slug === "string"
+                ? (input.data.brand_slug as string)
+                : undefined
+        if (explicit && this.brandContexts_.has(explicit)) {
+            return this.brandContexts_.get(explicit)!
+        }
+
+        const sessionId =
+            typeof input.data?.session_id === "string"
+                ? (input.data.session_id as string)
+                : undefined
+        if (sessionId && sessionId.startsWith("cart_")) {
+            try {
+                const cartModule: any = safeResolve(this.container_, [
+                    Modules.CART,
+                    "cartModuleService",
+                    "cartService",
+                ])
+                if (cartModule?.retrieveCart) {
+                    const cart = await cartModule.retrieveCart(sessionId, {
+                        select: ["id", "metadata"],
+                    })
+                    const slug =
+                        cart && cart.metadata
+                            ? ((cart.metadata as Record<string, unknown>)
+                                  .storefront as string | undefined)
+                            : undefined
+                    if (slug && this.brandContexts_.has(slug)) {
+                        return this.brandContexts_.get(slug)!
+                    }
+                }
+            } catch (err: unknown) {
+                this.logger_.warn(
+                    `Fena: brand-resolve via cart ${sessionId} failed — ${getErrorMessage(err)}; falling through to default merchant`
+                )
+            }
+        }
+
+        return this.brandContexts_.get(DEFAULT_BRAND_SLUG)!
+    }
+
+    /**
+     * Resolve the merchant that owns a specific Fena payment id by trying
+     * each brand client. Used by the webhook handler (where the inbound
+     * payload tells us a payment id but not which merchant it belongs to)
+     * and any other code path that has a Fena id but no cart/session.
+     *
+     * Returns the first context whose client successfully retrieves the
+     * payment, plus the fetched payment object so callers don't re-fetch.
+     * Returns null only if NO merchant recognises the id — typically
+     * because the webhook is for a payment from a Fena terminal we don't
+     * have configured here (mis-routed dashboard config).
+     */
+    protected async resolveContextByFenaId(
+        fenaPaymentId: string
+    ): Promise<{ ctx: BrandContext; payment: any; kind: "single" | "recurring" } | null> {
+        // Try single payment on each client
+        for (const ctx of this.brandContexts_.values()) {
+            try {
+                const payment = await ctx.client.getPayment(fenaPaymentId)
+                if (payment) {
+                    return { ctx, payment, kind: "single" }
+                }
+            } catch {
+                // Try next client (likely 404 from a non-owner merchant)
+            }
+        }
+        // Try recurring payment on each client
+        for (const ctx of this.brandContexts_.values()) {
+            try {
+                const payment = await ctx.client.getRecurringPayment(fenaPaymentId)
+                if (payment) {
+                    return { ctx, payment, kind: "recurring" }
+                }
+            } catch {
+                // Try next client
+            }
+        }
+        return null
     }
 
     // ──────────────────────────────────────────────────────
@@ -232,6 +423,13 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     },
                 }
             }
+
+            // Resolve which merchant set to use for this storefront's flow.
+            // Per-brand routing keys off cart.metadata.storefront (set by the
+            // storefront on cart create); we stamp the resolved slug into
+            // the returned session data so authorize/capture/etc. avoid the
+            // cart lookup on every subsequent call.
+            const { client, opts, slug: brandSlug } = await this.resolveContext(input)
 
             const isRecurring = !!input.data?.is_recurring
             const sessionId = getDataString(input.data, "session_id") ?? `cart_${Date.now()}`
@@ -305,14 +503,14 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 const shippingAddress = formatAddress((input.data as any)?.shipping_address)
                 const billingAddress = formatAddress((input.data as any)?.billing_address)
 
-                const response = await this.client_.createAndProcessRecurringPayment({
+                const response = await client.createAndProcessRecurringPayment({
                     reference,
                     recurringAmount: formattedAmount,
                     recurringPaymentDate: startDate.toISOString(),
                     numberOfPayments: 0, // Indefinite by default
                     frequency,
                     initialPaymentAmount: formattedAmount, // CHARGE IMMEDIATELY
-                    bankAccount: this.options_.bankAccountId,
+                    bankAccount: opts.bankAccountId,
                     customerName: customerName || "Customer",
                     customerEmail: customerEmail || "unknown@example.com",
                 })
@@ -321,18 +519,18 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
                 // Attach notes AFTER creation — create-and-process doesn't persist notes
                 try {
-                    await this.client_.attachRecurringPaymentNote(payment.id, {
+                    await client.attachRecurringPaymentNote(payment.id, {
                         text: `medusa_session:${sessionId}`,
                         visibility: "restricted",
                     })
                     if (shippingAddress) {
-                        await this.client_.attachRecurringPaymentNote(payment.id, {
+                        await client.attachRecurringPaymentNote(payment.id, {
                             text: `Shipping: ${shippingAddress}`,
                             visibility: "restricted",
                         })
                     }
                     if (billingAddress) {
-                        await this.client_.attachRecurringPaymentNote(payment.id, {
+                        await client.attachRecurringPaymentNote(payment.id, {
                             text: `Billing: ${billingAddress}`,
                             visibility: "restricted",
                         })
@@ -353,6 +551,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         is_recurring: true,
                         currency_code,
                         session_id: sessionId,
+                        brand_slug: brandSlug,
                     },
                 }
             }
@@ -371,24 +570,25 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "restricted" })
 
             // Customer-facing description shown on the Fena page + bank app.
-            // Generic by default; merchants can supply `storeName` in provider
-            // options for a branded prefix. The traceable session id lives in
-            // the restricted note above, not in the description.
-            const storeName = this.options_.storeName?.trim()
+            // Generic by default; per-brand storeName overrides the default
+            // so BUYELORA customers see "BUYELORA order — …" etc. The
+            // traceable session id lives in the restricted note above, not
+            // in the description.
+            const storeName = opts.storeName?.trim()
             const description = storeName
                 ? `${storeName} order — ref ${reference}`
                 : `Order — ref ${reference}`
 
             // Standard Single Payment
-            const response = await this.client_.createAndProcessPayment({
+            const response = await client.createAndProcessPayment({
                 reference,
                 amount: formattedAmount,
-                bankAccount: this.options_.bankAccountId,
-                paymentMethod: this.options_.paymentMethod || FenaPaymentMethod.FenaOB,
+                bankAccount: opts.bankAccountId,
+                paymentMethod: opts.paymentMethod || FenaPaymentMethod.FenaOB,
                 customerName,
                 customerEmail,
-                customRedirectUrl: this.options_.redirectUrl
-                    ? this.options_.redirectUrl.replace("{cart_id}", sessionId)
+                customRedirectUrl: opts.redirectUrl
+                    ? opts.redirectUrl.replace("{cart_id}", sessionId)
                     : undefined,
                 description,
                 notes,
@@ -397,7 +597,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             const payment = response.result
 
             this.logger_.info(
-                `Fena: Payment created — ID: ${payment.id}, Link: ${payment.link}`
+                `Fena: Payment created — ID: ${payment.id}, Link: ${payment.link} (brand=${brandSlug})`
             )
 
             return {
@@ -410,6 +610,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     fena_payment_status: payment.status,
                     fena_reference: reference,
                     currency_code,
+                    brand_slug: brandSlug,
                 },
             }
         } catch (error: unknown) {
@@ -443,6 +644,12 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             )
         }
 
+        // Resolve which merchant client to use. The brand_slug stamped
+        // during initiatePayment is the fast path; missing it (e.g. legacy
+        // sessions created before per-brand routing) falls through to the
+        // default client which is still correct for the single-tenant era.
+        const { client } = await this.resolveContext(input)
+
         try {
             // Handle off-session renewals or passive records
             const isPassive = input.data?.is_passive || (input.context as any)?.is_passive
@@ -463,7 +670,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
                 // For standing orders, we just check if it's still active.
                 // The actual money capture will happen via webhook when the bank pushes.
-                const payment = await this.getPaymentOrRecurring(fenaPaymentId)
+                const payment = await this.getPaymentOrRecurring(fenaPaymentId, client)
                 const status = this.mapFenaStatusToMedusa(payment.status)
 
                 return {
@@ -475,7 +682,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 }
             }
 
-            const payment = await this.getPaymentOrRecurring(fenaPaymentId)
+            const payment = await this.getPaymentOrRecurring(fenaPaymentId, client)
 
             // For recurring payments, Fena leaves the parent `status` at "sent" even after
             // the initial charge has cleared at the bank — the truth lives in
@@ -529,8 +736,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             return { data: input.data }
         }
 
+        const { client } = await this.resolveContext(input)
+
         try {
-            const payment = await this.getPaymentOrRecurring(fenaPaymentId)
+            const payment = await this.getPaymentOrRecurring(fenaPaymentId, client)
 
             // Accept recurring.initialPayment.status === "paid" as capture confirmation —
             // same reasoning as authorizePayment (Fena leaves the recurring parent at "sent"
@@ -659,8 +868,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             return { data: input.data }
         }
 
+        const { client } = await this.resolveContext(input)
+
         try {
-            const payment = await this.client_.getPayment(fenaPaymentId)
+            const payment = await client.getPayment(fenaPaymentId)
             return {
                 data: {
                     ...input.data,
@@ -725,8 +936,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             return { status: "pending" as PaymentSessionStatus }
         }
 
+        const { client } = await this.resolveContext(input)
+
         try {
-            const payment = await this.client_.getPayment(fenaPaymentId)
+            const payment = await client.getPayment(fenaPaymentId)
             return { status: this.mapFenaStatusToMedusa(payment.status) }
         } catch (error: unknown) {
             this.logger_.error(`Fena: getPaymentStatus failed — ${getErrorMessage(error)}`)
@@ -811,10 +1024,31 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 }
             }
 
+            // Webhook payloads don't carry the merchant integration id, so
+            // we discover the owning brand by asking each configured client
+            // in turn. The first one to return a payment owns the id; the
+            // rest 404 cheaply. Result is cached in `resolvedByFenaId` and
+            // reused for any later API call against this payment in this
+            // handler invocation.
+            const resolvedByFenaId = await this.resolveContextByFenaId(fenaPaymentId)
+            const webhookClient = resolvedByFenaId?.ctx.client ?? this.client_
+            if (resolvedByFenaId) {
+                this.logger_.info(
+                    `Fena webhook: payment ${fenaPaymentId} owned by brand=${resolvedByFenaId.ctx.slug}`
+                )
+            } else {
+                this.logger_.warn(
+                    `Fena webhook: no configured merchant recognises payment ${fenaPaymentId} — proceeding with default client (may 404)`
+                )
+            }
+
             try {
                 // Try Single Payment first
                 try {
-                    const payment = await this.client_.getPayment(fenaPaymentId)
+                    const payment =
+                        resolvedByFenaId?.kind === "single"
+                            ? resolvedByFenaId.payment
+                            : await webhookClient.getPayment(fenaPaymentId)
                     authenticStatus = payment.status
 
                     // Prefer the restricted `medusa_session:` note (new
@@ -845,7 +1079,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     }
                 } catch (e) {
                     // Try Recurring Payment
-                    const recurring = await this.client_.getRecurringPayment(fenaPaymentId)
+                    const recurring =
+                        resolvedByFenaId?.kind === "recurring"
+                            ? resolvedByFenaId.payment
+                            : await webhookClient.getRecurringPayment(fenaPaymentId)
                     authenticStatus = recurring.status
 
                     // Search in notes for medusa_session (stored as { text: "medusa_session:xxx" })
@@ -1031,14 +1268,16 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         eventName: string,
         status: string,
     ): Promise<void> {
-        // 1. Fetch recurring payment from Fena to get notes
-        let recurring: FenaRecurringPayment
-        try {
-            recurring = await this.client_.getRecurringPayment(fenaPaymentId)
-        } catch {
-            this.logger_.info(`Fena subscription handler: could not fetch recurring ${fenaPaymentId}, skipping`)
+        // 1. Resolve owning merchant (try each brand client) then fetch
+        //    the recurring payment from that merchant's Fena terminal.
+        //    Without per-brand routing the wrong merchant's secret would
+        //    return 404 for every brand-override subscription.
+        const resolved = await this.resolveContextByFenaId(fenaPaymentId)
+        if (!resolved || resolved.kind !== "recurring") {
+            this.logger_.info(`Fena subscription handler: could not fetch recurring ${fenaPaymentId} on any configured merchant, skipping`)
             return
         }
+        const recurring = resolved.payment as FenaRecurringPayment
 
         // 2. Find medusa_subscription:xxx note
         const notes = recurring.notes || []
@@ -1347,8 +1586,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             let customerName: string | undefined
             let capturedAtIso = new Date().toISOString()
             try {
-                const fenaPayment =
-                    await this.client_.getPayment(args.fenaPaymentId)
+                // Find which merchant owns this id (per-brand routing).
+                const resolved = await this.resolveContextByFenaId(args.fenaPaymentId)
+                const fenaPayment = resolved?.kind === "single"
+                    ? resolved.payment
+                    : await this.client_.getPayment(args.fenaPaymentId)
                 customerEmail = fenaPayment.customerEmail || ""
                 customerName = fenaPayment.customerName
                 capturedAtIso = fenaPayment.createdAt
@@ -1562,16 +1804,23 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
     }
 
     /**
-     * Helper to retrieve either a single payment or a recurring payment.
+     * Retrieve either a single payment or a recurring payment using a
+     * specific brand client. Per-brand routing requires the caller to
+     * supply the right client (resolved via `resolveContext` or
+     * `resolveContextByFenaId`) — using `this.client_` here would always
+     * hit the default merchant and 404 on every brand-override payment.
      */
-    private async getPaymentOrRecurring(id: string): Promise<any> {
+    private async getPaymentOrRecurring(
+        id: string,
+        client: FenaClient = this.client_
+    ): Promise<any> {
         try {
             // Check if it's a single payment first
-            return await this.client_.getPayment(id)
+            return await client.getPayment(id)
         } catch (e) {
             // Try recurring
             try {
-                return await this.client_.getRecurringPayment(id)
+                return await client.getRecurringPayment(id)
             } catch (recurringError) {
                 throw new Error(`Failed to retrieve payment or recurring payment with ID ${id}`)
             }
