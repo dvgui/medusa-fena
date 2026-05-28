@@ -1574,6 +1574,23 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         currencyCode: string
     }): Promise<boolean> {
         try {
+            // Resolve the payment-session probe. `query` (the high-level
+            // joiner-backed graph service) is NOT registered in the payment
+            // provider's child scope in Medusa v2.13, so we prefer the
+            // payment module's internal `paymentSessionService` which IS
+            // available here (other code paths in this file already use it).
+            // `query` is kept as a fallback for future Medusa versions that
+            // do inject it.
+            type PaymentSessionProbe = {
+                retrieve: (
+                    id: string,
+                    options?: Record<string, unknown>,
+                ) => Promise<{
+                    id: string
+                    status?: string | null
+                    deleted_at?: string | Date | null
+                } | null>
+            }
             type QueryService = {
                 graph: (opts: Record<string, unknown>) => Promise<{
                     data: Array<{
@@ -1583,35 +1600,92 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     }>
                 }>
             }
+            const paymentSessionService = safeResolve<PaymentSessionProbe>(
+                this.container_,
+                ["paymentSessionService"],
+            )
             const query = safeResolve<QueryService>(
                 this.container_,
                 ["query", "__query__", "remoteQuery"],
             )
-            if (!query) {
-                this.logger_.warn(
-                    `Fena orphan-check: query not registered in payment-provider scope; skipping detection for session ${args.sessionId}. Recovery script remains available.`,
-                )
-                return false
+
+            let isOrphan: boolean
+            let probeOutcome:
+                | { kind: "found"; status?: string | null; deletedAt?: string | Date | null }
+                | { kind: "missing" }
+                | { kind: "unverified"; reason: string }
+
+            if (paymentSessionService) {
+                try {
+                    const session = await paymentSessionService.retrieve(
+                        args.sessionId,
+                        { select: ["id", "status", "deleted_at"] },
+                    )
+                    probeOutcome = session
+                        ? {
+                              kind: "found",
+                              status: session.status,
+                              deletedAt: session.deleted_at,
+                          }
+                        : { kind: "missing" }
+                } catch (e) {
+                    const msg = getErrorMessage(e)
+                    // Medusa internal services throw a NotFoundError for missing rows.
+                    if (/not found/i.test(msg)) {
+                        probeOutcome = { kind: "missing" }
+                    } else {
+                        probeOutcome = {
+                            kind: "unverified",
+                            reason: `paymentSessionService.retrieve threw: ${msg}`,
+                        }
+                    }
+                }
+            } else if (query) {
+                const { data: sessions } = await query.graph({
+                    entity: "payment_session",
+                    fields: ["id", "status", "deleted_at"],
+                    filters: { id: args.sessionId },
+                })
+                const session = sessions?.[0]
+                probeOutcome = session
+                    ? {
+                          kind: "found",
+                          status: session.status,
+                          deletedAt: session.deleted_at,
+                      }
+                    : { kind: "missing" }
+            } else {
+                probeOutcome = {
+                    kind: "unverified",
+                    reason: "neither paymentSessionService nor query registered in payment-provider scope",
+                }
             }
 
-            const { data: sessions } = await query.graph({
-                entity: "payment_session",
-                fields: ["id", "status", "deleted_at"],
-                filters: { id: args.sessionId },
-            })
-            const session = sessions?.[0]
-            const isOrphan =
-                !session ||
-                session.deleted_at != null ||
-                session.status === "canceled"
-
-            if (!session) {
+            if (probeOutcome.kind === "found") {
+                const deleted = probeOutcome.deletedAt != null
+                const canceled = probeOutcome.status === "canceled"
+                isOrphan = deleted || canceled
+                if (isOrphan) {
+                    this.logger_.warn(
+                        `Fena orphan-check: session ${args.sessionId} status=${probeOutcome.status} deleted_at=${probeOutcome.deletedAt} — treating fena_payment_id ${args.fenaPaymentId} as orphan-paid`,
+                    )
+                }
+            } else if (probeOutcome.kind === "missing") {
+                isOrphan = true
                 this.logger_.warn(
                     `Fena orphan-check: session ${args.sessionId} missing — treating fena_payment_id ${args.fenaPaymentId} as orphan-paid`,
                 )
-            } else if (isOrphan) {
+            } else {
+                // Cannot verify session state from this scope. Emit
+                // optimistically: the recovery workflow is idempotent on
+                // fena_payment_id and exits cleanly via `alreadyHasOrder`
+                // when the cart was already converted to an order. Without
+                // emitting here, a paid webhook against a deleted session
+                // silently fails Medusa core's authorize step and the order
+                // is never created — the bug that motivated this safety net.
+                isOrphan = true
                 this.logger_.warn(
-                    `Fena orphan-check: session ${args.sessionId} status=${session.status} deleted_at=${session.deleted_at} — treating fena_payment_id ${args.fenaPaymentId} as orphan-paid`,
+                    `Fena orphan-check: cannot verify session ${args.sessionId} (${probeOutcome.reason}); emitting payment.fena_orphan_paid optimistically — recovery workflow is idempotent`,
                 )
             }
 
