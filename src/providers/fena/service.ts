@@ -1405,6 +1405,16 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         `Fena subscription handler: status-update to "${normalizedStatus}", no action`
                     )
                 }
+
+                // A renewal-link customer pays the initial amount during the
+                // same bank flow that authorizes the standing order, and that
+                // payment never shows up in transactions[] — scan for it here
+                // too so the renewal order isn't deferred to the next cycle.
+                await this.emitSettledRenewalPayments(
+                    recurring,
+                    subscriptionIds,
+                    fenaPaymentId
+                )
                 break
             }
 
@@ -1416,73 +1426,15 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 // the NEXT cycle, not the one that just settled).
                 //
                 // Treat this event as a wake-up signal: re-scan the
-                // recurring's transactions and emit one
-                // subscription.fena_renewal_paid event per transaction whose
-                // status === "completed". The subscriber's
-                // fena_renewal_handled_txns set provides idempotency, so
-                // re-emitting for already-handled txns is safe.
-                const txns = (recurring.transactions || []) as Array<{
-                    id?: string
-                    status?: string
-                    amount?: string
-                    completedAt?: string
-                    createdAt?: string
-                }>
-                const completedTxns = txns.filter(
-                    (t) => (t.status || "").toLowerCase() === "completed" && t.id
+                // recurring's settled payments and emit one
+                // subscription.fena_renewal_paid event per settled item.
+                // The subscriber's fena_renewal_handled_txns set provides
+                // idempotency, so re-emitting for already-handled txns is safe.
+                await this.emitSettledRenewalPayments(
+                    recurring,
+                    subscriptionIds,
+                    fenaPaymentId
                 )
-
-                const eventBus = safeResolve<{
-                    emit: (input: {
-                        name: string
-                        data: Record<string, unknown>
-                    }) => Promise<unknown>
-                }>(
-                    this.container_,
-                    [Modules.EVENT_BUS, "eventBusService", "__event_bus__"]
-                )
-
-                if (!eventBus) {
-                    this.logger_.warn(
-                        `Fena subscription handler: event bus not available — can't emit subscription.fena_renewal_paid for ${fenaPaymentId}`
-                    )
-                    break
-                }
-
-                if (completedTxns.length === 0) {
-                    this.logger_.info(
-                        `Fena subscription handler: payment_made for ${fenaPaymentId} but no completed transactions yet (have ${txns.length} txn(s) with statuses [${txns.map((t) => t.status).join(",")}]). Subscriber will retry when a transaction completes.`
-                    )
-                    break
-                }
-
-                this.logger_.info(
-                    `Fena subscription handler: ${completedTxns.length} completed transaction(s) on ${fenaPaymentId} — emitting per-txn events`
-                )
-
-                for (const txn of completedTxns) {
-                    const amountStr = txn.amount || recurring.recurringAmount || "0"
-                    const paidAtIso = txn.completedAt || txn.createdAt || new Date().toISOString()
-                    try {
-                        await eventBus.emit({
-                            name: "subscription.fena_renewal_paid",
-                            data: {
-                                subscription_ids: subscriptionIds,
-                                fena_payment_id: fenaPaymentId,
-                                fena_transaction_id: txn.id,
-                                amount: Number(amountStr),
-                                paid_at_iso: paidAtIso,
-                            },
-                        })
-                        this.logger_.info(
-                            `Fena subscription handler: emitted subscription.fena_renewal_paid for subs [${subscriptionIds.join(",")}] (txn=${txn.id}, amount=${amountStr})`
-                        )
-                    } catch (emitErr: unknown) {
-                        this.logger_.error(
-                            `Fena subscription handler: emit failed for txn ${txn.id} — ${getErrorMessage(emitErr)}`
-                        )
-                    }
-                }
                 break
             }
 
@@ -1546,6 +1498,104 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             default:
                 this.logger_.info(`Fena subscription handler: unhandled event "${eventName}" for ${subscriptionIds.join(",")}`)
+        }
+    }
+
+    /**
+     * Emit one `subscription.fena_renewal_paid` event per settled payment on
+     * a recurring: completed entries from transactions[] PLUS the initial
+     * payment when paid. Renewal links created with initialPaymentAmount
+     * settle that first debit as `recurring.initialPayment` — it never
+     * appears in transactions[], so scanning transactions alone misses it
+     * entirely (orders were silently skipped until the next cycle's debit).
+     *
+     * Initial payments are keyed by their externalReference (stable, unique)
+     * since the API exposes no transaction id for them. The subscriber's
+     * fena_renewal_handled_txns set dedupes re-emits, and its initial-vs-
+     * renewal classifier absorbs signup initial payments (paid within
+     * minutes of subscription creation → recorded, no order).
+     */
+    private async emitSettledRenewalPayments(
+        recurring: FenaRecurringPayment,
+        subscriptionIds: string[],
+        fenaPaymentId: string,
+    ): Promise<void> {
+        const txns = (recurring.transactions || []) as Array<{
+            id?: string
+            status?: string
+            amount?: string
+            completedAt?: string
+            createdAt?: string
+        }>
+        const settled: Array<{ key: string; amount?: string; paidAtIso: string }> = txns
+            .filter((t) => (t.status || "").toLowerCase() === "completed" && t.id)
+            .map((t) => ({
+                key: t.id as string,
+                amount: t.amount,
+                paidAtIso: t.completedAt || t.createdAt || new Date().toISOString(),
+            }))
+
+        const ip = recurring.initialPayment
+        const ipPaidAt = ip?.completedAt || ip?.createdAt
+        // No timestamp → can't classify initial-vs-renewal downstream; skip
+        // rather than risk a misdated emit creating a bogus order.
+        if (ip && (ip.status || "").toLowerCase() === "paid" && ipPaidAt) {
+            settled.push({
+                key: ip.externalReference || `${recurring.id}-initial`,
+                amount: ip.amount,
+                paidAtIso: ipPaidAt,
+            })
+        }
+
+        if (settled.length === 0) {
+            this.logger_.info(
+                `Fena subscription handler: no settled payments yet on ${fenaPaymentId} (${txns.length} txn(s) [${txns.map((t) => t.status).join(",")}], initialPayment=${ip ? ip.status : "none"}). Subscriber will retry when one settles.`
+            )
+            return
+        }
+
+        const eventBus = safeResolve<{
+            emit: (input: {
+                name: string
+                data: Record<string, unknown>
+            }) => Promise<unknown>
+        }>(
+            this.container_,
+            [Modules.EVENT_BUS, "eventBusService", "__event_bus__"]
+        )
+
+        if (!eventBus) {
+            this.logger_.warn(
+                `Fena subscription handler: event bus not available — can't emit subscription.fena_renewal_paid for ${fenaPaymentId}`
+            )
+            return
+        }
+
+        this.logger_.info(
+            `Fena subscription handler: ${settled.length} settled payment(s) on ${fenaPaymentId} — emitting per-payment events`
+        )
+
+        for (const item of settled) {
+            const amountStr = item.amount || recurring.recurringAmount || "0"
+            try {
+                await eventBus.emit({
+                    name: "subscription.fena_renewal_paid",
+                    data: {
+                        subscription_ids: subscriptionIds,
+                        fena_payment_id: fenaPaymentId,
+                        fena_transaction_id: item.key,
+                        amount: Number(amountStr),
+                        paid_at_iso: item.paidAtIso,
+                    },
+                })
+                this.logger_.info(
+                    `Fena subscription handler: emitted subscription.fena_renewal_paid for subs [${subscriptionIds.join(",")}] (txn=${item.key}, amount=${amountStr})`
+                )
+            } catch (emitErr: unknown) {
+                this.logger_.error(
+                    `Fena subscription handler: emit failed for txn ${item.key} — ${getErrorMessage(emitErr)}`
+                )
+            }
         }
     }
 

@@ -286,7 +286,18 @@ export interface FenaRecurringPayment {
     frequency: FenaRecurringPaymentFrequency
     status: "draft" | "sent" | "active" | "paid" | "rejected" | "warning" | "cancelled" | "overdue"
     transactions: any[]
-    initialPayment?: { id: string; amount: string; status: string } | null
+    // The API returns no `id` for the initial payment; externalReference is
+    // its only stable unique key. status becomes "paid" once the customer
+    // completes the initial debit of a renewal link.
+    initialPayment?: {
+        id?: string
+        amount: string
+        status: string
+        reference?: string
+        externalReference?: string
+        createdAt?: string
+        completedAt?: string
+    } | null
     customerName?: string
     customerEmail?: string
     createdAt: string
