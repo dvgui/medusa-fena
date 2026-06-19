@@ -305,6 +305,9 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             typeof input.data?.brand_slug === "string"
                 ? (input.data.brand_slug as string)
                 : undefined
+        this.logger_.info(
+            `[FENADBG] resolveContext entry brand_slug=${JSON.stringify(input.data?.brand_slug)} session_id=${JSON.stringify(input.data?.session_id)} explicitMatch=${!!(explicit && this.brandContexts_.has(explicit))} dataKeys=${JSON.stringify(Object.keys(input.data ?? {}))}`
+        )
         if (explicit && this.brandContexts_.has(explicit)) {
             return this.brandContexts_.get(explicit)!
         }
