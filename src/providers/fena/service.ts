@@ -323,6 +323,9 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 : sessionId.startsWith("payses_")
                   ? await this.resolveBrandKeysFromPaymentSessionId(sessionId)
                   : []
+            this.logger_.info(
+                `[FENADBG] resolveContext sessionId=${sessionId} candidates=${JSON.stringify(candidates)} configured=${JSON.stringify([...this.brandContexts_.keys()])}`
+            )
             for (const slug of candidates) {
                 if (slug && this.brandContexts_.has(slug)) {
                     return this.brandContexts_.get(slug)!
@@ -394,6 +397,9 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             filters: { id: sessionId },
         })
         const row = (data as any[])[0]
+        this.logger_.info(
+            `[FENADBG] payses walk sessionId=${sessionId} queryOk=${!!query?.graph} gotRow=${!!row} cartId=${row?.payment_collection?.cart?.id} cartMeta=${JSON.stringify(row?.payment_collection?.cart?.metadata)}`
+        )
         return this.brandKeysFromMeta(
             row?.payment_collection?.cart?.metadata as
                 | Record<string, unknown>
