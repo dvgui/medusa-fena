@@ -287,8 +287,10 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
      * initiated payment flow. Tries, in order:
      *   1. Explicit `brand_slug` stamped into input.data (we stamp this in
      *      initiatePayment so authorize/capture/etc. avoid the cart lookup).
-     *   2. `session_id`:
-     *        - `cart_*` → cart.metadata.storefront via the cart module.
+     *   2. `session_id`, resolving cart metadata to candidate brand keys
+     *      (`funnel` preferred over `storefront`, so same-channel funnels can
+     *      route to their own merchant):
+     *        - `cart_*` → cart.metadata via the cart module.
      *        - `payses_*` → walk payment_session → payment_collection →
      *          cart via query.graph (Medusa's PaymentModule passes the
      *          payment_session id here, not the cart id).
@@ -316,13 +318,15 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         }
 
         try {
-            const slug = sessionId.startsWith("cart_")
-                ? await this.resolveStorefrontFromCartId(sessionId)
+            const candidates = sessionId.startsWith("cart_")
+                ? await this.resolveBrandKeysFromCartId(sessionId)
                 : sessionId.startsWith("payses_")
-                  ? await this.resolveStorefrontFromPaymentSessionId(sessionId)
-                  : undefined
-            if (slug && this.brandContexts_.has(slug)) {
-                return this.brandContexts_.get(slug)!
+                  ? await this.resolveBrandKeysFromPaymentSessionId(sessionId)
+                  : []
+            for (const slug of candidates) {
+                if (slug && this.brandContexts_.has(slug)) {
+                    return this.brandContexts_.get(slug)!
+                }
             }
         } catch (err: unknown) {
             this.logger_.warn(
@@ -333,51 +337,68 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         return this.brandContexts_.get(DEFAULT_BRAND_SLUG)!
     }
 
-    /** Cart id (cart_*) → cart.metadata.storefront. Returns undefined if
-     *  the cart isn't found, the cart module isn't registered in the
-     *  current container scope, or the storefront slug is missing. */
-    private async resolveStorefrontFromCartId(
+    /** Candidate brand keys from cart metadata, in priority order. The funnel
+     *  slug comes first so same-sales-channel funnels that share a storefront
+     *  slug (e.g. buyreta-uk.com, stamped `funnel: "buyretauk_com"`, sharing the
+     *  `buyreta_uk` storefront) can route to their own merchant; the storefront
+     *  slug is the fallback. resolveContext picks the first that is configured,
+     *  so an unconfigured funnel transparently falls back to the storefront. */
+    private brandKeysFromMeta(
+        meta: Record<string, unknown> | undefined
+    ): string[] {
+        const keys: string[] = []
+        if (typeof meta?.funnel === "string" && meta.funnel) {
+            keys.push(meta.funnel as string)
+        }
+        if (typeof meta?.storefront === "string" && meta.storefront) {
+            keys.push(meta.storefront as string)
+        }
+        return keys
+    }
+
+    /** Cart id (cart_*) → candidate brand keys from cart.metadata. Returns an
+     *  empty array if the cart isn't found, the cart module isn't registered in
+     *  the current container scope, or no routing keys are present. */
+    private async resolveBrandKeysFromCartId(
         cartId: string
-    ): Promise<string | undefined> {
+    ): Promise<string[]> {
         const cartModule: any = safeResolve(this.container_, [
             Modules.CART,
             "cartModuleService",
             "cartService",
         ])
-        if (!cartModule?.retrieveCart) return undefined
+        if (!cartModule?.retrieveCart) return []
         const cart = await cartModule.retrieveCart(cartId, {
             select: ["id", "metadata"],
         })
-        const meta = cart?.metadata as Record<string, unknown> | undefined
-        return typeof meta?.storefront === "string"
-            ? (meta.storefront as string)
-            : undefined
+        return this.brandKeysFromMeta(
+            cart?.metadata as Record<string, unknown> | undefined
+        )
     }
 
     /** payment_session id (payses_*) → payment_collection → cart.metadata.
      *  Uses query.graph so we don't need the payment / cart modules to be
      *  injected into the provider scope (they're not in v2). */
-    private async resolveStorefrontFromPaymentSessionId(
+    private async resolveBrandKeysFromPaymentSessionId(
         sessionId: string
-    ): Promise<string | undefined> {
+    ): Promise<string[]> {
         const query: any = safeResolve(this.container_, [
             "query",
             "__query__",
             "remoteQuery",
         ])
-        if (!query?.graph) return undefined
+        if (!query?.graph) return []
         const { data } = await query.graph({
             entity: "payment_session",
             fields: ["id", "payment_collection.cart.id", "payment_collection.cart.metadata"],
             filters: { id: sessionId },
         })
         const row = (data as any[])[0]
-        const meta = row?.payment_collection?.cart?.metadata as
-            | Record<string, unknown>
-            | undefined
-        return typeof meta?.storefront === "string"
-            ? (meta.storefront as string)
-            : undefined
+        return this.brandKeysFromMeta(
+            row?.payment_collection?.cart?.metadata as
+                | Record<string, unknown>
+                | undefined
+        )
     }
 
     /**
