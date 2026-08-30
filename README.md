@@ -6,7 +6,9 @@ Integrate [Fena](https://fena.co) Open Banking payments into your MedusaJS v2 st
 
 - **Open Banking redirect flow** — customer selects their bank and authorizes payment
 - **QR code support** — display a QR code for mobile payments
-- **Webhook handling** — automatic payment status updates
+- **Redirect-time settlement verification** — a Fena-paid checkout completes without waiting for a webhook
+- **Webhook handling** — asynchronous payment status backup and orphan recovery
+- **Durable checkout identity** — cart/session references are attached to Fena and emitted for host-side reconciliation
 - **Instant payments** — no separate capture step needed
 - **Zero external dependencies** — uses native `fetch`, no SDK required
 
@@ -84,13 +86,13 @@ When this ID is passed, Fena automatically transitions the payment session into 
 
 ## Webhook Setup
 
-The plugin relies on Medusa v2's native webhook routing engine at:
+The plugin uses Medusa v2's native webhook routing engine at:
 
 ```
 POST https://your-medusa-backend.com/hooks/payment/fena_fena-ob
 ```
 
-Configure this URL in your [Fena Dashboard](https://dashboard.fena.co) under your API key's webhook settings.
+Configure this URL in your [Fena Dashboard](https://dashboard.fena.co) under your API key's webhook settings. Webhooks remain important for retries and customers who do not return to the storefront, but a returning customer is verified against Fena synchronously and does not wait for webhook delivery.
 
 ## How It Works
 
@@ -98,15 +100,19 @@ Configure this URL in your [Fena Dashboard](https://dashboard.fena.co) under you
 Customer → Checkout → Selects Fena → Redirected to Fena
     → Picks bank → Authorizes in banking app
     → Redirected back to your store
-    → Fena sends webhook → Order completes
+    → Store verifies Fena status → Order completes
+    → Fena webhook/reconciler provides an independent backup
 ```
 
 1. **`initiatePayment`** — creates a Fena payment and returns a redirect URL + QR code data
 2. Customer is redirected to Fena's payment page
 3. Customer selects their bank and authorizes the payment
 4. Customer is redirected back to your store with `?payment_id=&status=` query params
-5. Fena sends a webhook notification → plugin maps it to Medusa payment actions
-6. **`authorizePayment`** — verifies the payment status with Fena's API
+5. The storefront asks Medusa to complete the cart
+6. **`authorizePayment`** verifies the live Fena status. A settled payment returns `captured`, allowing Medusa's complete-cart workflow to create the capture and order transaction atomically; an active recurring mandate returns `authorized`; an unsettled payment remains `pending`.
+7. Fena webhook notifications still map to Medusa payment actions. If the original session was deleted, the plugin emits an exact-cart orphan event using its restricted `medusa_cart:` note.
+
+For checkout sessions, pass both `cart_id` and `brand_slug` in payment-session data. The plugin emits `payment.fena_attempt_created`; the host should persist that event outside `payment_session.data`, which Medusa may delete when a cart total or payment choice changes.
 
 ---
 
@@ -145,6 +151,11 @@ When a user selects Fena and clicks "Continue to review", the storefront calls:
 ```ts
 await initiatePaymentSession(cart, {
   provider_id: "pp_fena_ob",
+  data: {
+    cart_id: cart.id,
+    brand_slug: "your_storefront_slug",
+    email: cart.email,
+  },
 })
 ```
 
@@ -326,10 +337,10 @@ export async function GET(req: NextRequest, { params }: { params: Params }) {
 Then set your redirect URL to point to this route:
 
 ```env
-FENA_REDIRECT_URL=https://your-storefront.com/{country_code}/api/fena-callback/{cart_id}
+FENA_REDIRECT_URL=https://your-storefront.com/api/fena-callback/{cart_id}
 ```
 
-> **Note:** Replace `{cart_id}` or `{country_code}` dynamically in the URL! The plugin will automatically parse and inject the matching IDs.
+> **Note:** Keep the literal `{cart_id}` token in the configured URL. The plugin replaces that token with `data.cart_id` (and falls back to the session id for legacy callers). Fena appends its own `payment_id` and `status` query parameters, so do not add a query string to this URL.
 
 ### Step 5: QR Code Display (Optional)
 

@@ -7,8 +7,9 @@
  * 1. initiatePayment → calls Fena create-and-process → returns payment link
  * 2. Customer redirected to Fena → selects bank → authorizes in banking app
  * 3. Customer redirected back with ?order_id=&payment_id=&status=
- * 4. Fena sends webhook → getWebhookActionAndData maps to Medusa actions
- * 5. authorizePayment → confirms via Fena API status check
+ * 4. authorizePayment verifies Fena and reports already-settled payments as
+ *    captured, so redirect-time order placement does not depend on a webhook
+ * 5. Fena webhooks remain an asynchronous backup/retry path
  */
 
 import {
@@ -183,6 +184,30 @@ function formatAddress(address: any): string {
 // ────────────────────────────────────────────────────────
 
 export const FENA_PROVIDER_ID = "fena-ob"
+
+/**
+ * Translate Fena's live state into the state Medusa should persist while
+ * completing checkout. A bank-settled payment is already captured in the real
+ * world; returning `captured` makes Medusa create its capture bookkeeping and
+ * order transaction in the same complete-cart workflow.
+ *
+ * `active` alone only proves that a recurring mandate exists. It authorizes the
+ * session but must not pretend the initial debit settled.
+ */
+export const fenaAuthorizationStatus = (input: {
+    effectiveStatus: string
+    initialPaymentPaid: boolean
+}): PaymentSessionStatus => {
+    const status = input.effectiveStatus.toLowerCase()
+    if (
+        input.initialPaymentPaid ||
+        ["paid", "payment-made", "payment-confirmed"].includes(status)
+    ) {
+        return "captured" as PaymentSessionStatus
+    }
+    if (status === "active") return "authorized" as PaymentSessionStatus
+    return "pending" as PaymentSessionStatus
+}
 
 // ────────────────────────────────────────────────────────
 // Provider Service
@@ -450,6 +475,65 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
         return null
     }
 
+    /**
+     * Persist an external-attempt signal outside the disposable Medusa payment
+     * session. The host records it on cart metadata, so refreshing checkout and
+     * hard-deleting the session cannot erase the only local copy of Fena's id.
+     * Best effort: the external payment already exists, so an event-bus outage
+     * must be surfaced loudly but cannot be made transactional after the fact.
+     */
+    private async emitFenaAttemptCreated(input: {
+        cartId?: string
+        paymentSessionId: string
+        fenaPaymentId: string
+        fenaReference: string
+        amount: number
+        currencyCode: string
+        brandSlug: string
+        createdAtIso: string
+        kind: "single" | "recurring"
+    }): Promise<void> {
+        if (!input.cartId) {
+            this.logger_.warn(
+                `Fena: attempt ${input.fenaPaymentId} has no cart_id; durable cart ledger is unavailable for this non-checkout flow`,
+            )
+            return
+        }
+        const eventBus = safeResolve<{
+            emit: (input: {
+                name: string
+                data: Record<string, unknown>
+            }) => Promise<unknown>
+        }>(this.container_, [Modules.EVENT_BUS, "eventBusService", "__event_bus__"])
+        if (!eventBus) {
+            throw new MedusaError(
+                MedusaError.Types.UNEXPECTED_STATE,
+                `Fena: cannot persist attempt ${input.fenaPaymentId} because the event bus is unavailable`,
+            )
+        }
+        try {
+            const attemptDate = new Date(input.createdAtIso)
+            if (Number.isNaN(attemptDate.getTime())) {
+                throw new Error("Fena returned an invalid attempt timestamp")
+            }
+            await eventBus.emit({
+                name: "payment.fena_attempt_created",
+                data: {
+                    ...input,
+                    createdAtIso: attemptDate.toISOString(),
+                },
+            })
+        } catch (error: unknown) {
+            this.logger_.error(
+                `Fena: failed to emit payment.fena_attempt_created for ${input.fenaPaymentId} — ${getErrorMessage(error)}`,
+            )
+            throw new MedusaError(
+                MedusaError.Types.UNEXPECTED_STATE,
+                "Fena payment attempt could not be recorded safely",
+            )
+        }
+    }
+
     // ──────────────────────────────────────────────────────
     // initiatePayment
     // ──────────────────────────────────────────────────────
@@ -504,6 +588,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
 
             const isRecurring = !!input.data?.is_recurring
             const sessionId = getDataString(input.data, "session_id") ?? `cart_${Date.now()}`
+            const cartId = getDataString(input.data, "cart_id")
             const reference = sessionId.replace(/[^a-z0-9]/gi, "").slice(-12)
             const formattedAmount = Number(amount).toFixed(2)
 
@@ -594,6 +679,12 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         text: `medusa_session:${sessionId}`,
                         visibility: "restricted",
                     })
+                    if (cartId) {
+                        await client.attachRecurringPaymentNote(payment.id, {
+                            text: `medusa_cart:${cartId}`,
+                            visibility: "restricted",
+                        })
+                    }
                     if (shippingAddress) {
                         await client.attachRecurringPaymentNote(payment.id, {
                             text: `Shipping: ${shippingAddress}`,
@@ -609,6 +700,17 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 } catch (noteErr: unknown) {
                     this.logger_.warn(`Fena: Failed to attach notes to recurring ${payment.id}: ${getErrorMessage(noteErr)}`)
                 }
+                await this.emitFenaAttemptCreated({
+                    cartId,
+                    paymentSessionId: sessionId,
+                    fenaPaymentId: payment.id,
+                    fenaReference: reference,
+                    amount: Number(formattedAmount),
+                    currencyCode: currency_code.toUpperCase(),
+                    brandSlug,
+                    createdAtIso: payment.createdAt ?? new Date().toISOString(),
+                    kind: "recurring",
+                })
                 return {
                     id: payment.id,
                     data: {
@@ -637,6 +739,9 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             // visibility means the customer never sees this in the bank app.
             // Mirrors the pattern recurring payments already use.
             notes.push({ text: `medusa_session:${sessionId}`, visibility: "restricted" })
+            if (cartId) {
+                notes.push({ text: `medusa_cart:${cartId}`, visibility: "restricted" })
+            }
             if (shippingAddress) notes.push({ text: `Shipping: ${shippingAddress}`, visibility: "restricted" })
             if (billingAddress) notes.push({ text: `Billing: ${billingAddress}`, visibility: "restricted" })
 
@@ -659,7 +764,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 customerName,
                 customerEmail,
                 customRedirectUrl: opts.redirectUrl
-                    ? opts.redirectUrl.replace("{cart_id}", sessionId)
+                    ? opts.redirectUrl.replace("{cart_id}", cartId ?? sessionId)
                     : undefined,
                 description,
                 notes,
@@ -670,6 +775,18 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             this.logger_.info(
                 `Fena: Payment created — ID: ${payment.id}, Link: ${payment.link} (brand=${brandSlug})`
             )
+
+            await this.emitFenaAttemptCreated({
+                cartId,
+                paymentSessionId: sessionId,
+                fenaPaymentId: payment.id,
+                fenaReference: reference,
+                amount: Number(formattedAmount),
+                currencyCode: currency_code.toUpperCase(),
+                brandSlug,
+                createdAtIso: payment.createdAt ?? new Date().toISOString(),
+                kind: "single",
+            })
 
             return {
                 id: payment.id,
@@ -764,8 +881,11 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                 (payment as FenaRecurringPayment).initialPayment?.status === "paid"
             const effectiveStatus = initialPaidOnRecurring ? "paid" : payment.status
             const fenaStatus = effectiveStatus.toLowerCase()
-            const confirmedStatuses = ["paid", "active", "payment-made", "payment-confirmed"]
-            const isConfirmed = confirmedStatuses.includes(fenaStatus)
+            const authorizationStatus = fenaAuthorizationStatus({
+                effectiveStatus: fenaStatus,
+                initialPaymentPaid: initialPaidOnRecurring,
+            })
+            const isConfirmed = authorizationStatus !== "pending"
             const isSent = fenaStatus === "sent" || fenaStatus === FenaPaymentStatus.Sent
 
             this.logger_.info(
@@ -777,7 +897,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     ...input.data,
                     fena_payment_status: payment.status,
                 },
-                status: (isConfirmed ? "authorized" : "pending") as PaymentSessionStatus,
+                status: authorizationStatus,
             }
         } catch (error: unknown) {
             const msg = getErrorMessage(error)
@@ -1056,6 +1176,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             // We encoded it in the payment description as: [medusa_session:payses_...]
             // Call Fena API to get the full payment details and extract the session ID.
             let sessionId = ""
+            let cartId = ""
             // Use the authentic status from the API instead of trusting the webhook payload
             let authenticStatus = webhookStatus
 
@@ -1148,6 +1269,14 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                             )
                         }
                     }
+                    const noteCart = (payment as any).notes?.find?.(
+                        (n: any) =>
+                            typeof n?.text === "string" &&
+                            n.text.startsWith("medusa_cart:"),
+                    )
+                    if (noteCart) {
+                        cartId = String(noteCart.text).slice("medusa_cart:".length)
+                    }
                 } catch (e) {
                     // Try Recurring Payment
                     const recurring =
@@ -1164,6 +1293,20 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                         const match = sessionNote.text.match(/medusa_session:(.+)/)
                         sessionId = match?.[1] || ""
                         this.logger_.info(`Fena webhook: recovered session_id from recurring notes: ${sessionId}`)
+                    }
+                    const recurringNotes = [
+                        ...((recurring as any).notes ?? []),
+                        ...((recurring as any).transactions?.flatMap?.(
+                            (transaction: any) => transaction?.notes ?? [],
+                        ) ?? []),
+                    ]
+                    const cartNote = recurringNotes.find(
+                        (note: any) =>
+                            typeof note?.text === "string" &&
+                            note.text.startsWith("medusa_cart:"),
+                    )
+                    if (cartNote) {
+                        cartId = String(cartNote.text).slice("medusa_cart:".length)
                     }
                 }
 
@@ -1241,6 +1384,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
                     // core's authorize step. Emit an app-handled event
                     // and return NOT_SUPPORTED so core skips its flow.
                     const orphanEmitted = await this.maybeEmitFenaOrphanPaid({
+                        cartId: cartId || undefined,
                         sessionId,
                         fenaPaymentId,
                         fenaReference: reference || "",
@@ -1647,6 +1791,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
      * want orphan-detection to mask legitimate paid webhooks).
      */
     private async maybeEmitFenaOrphanPaid(args: {
+        cartId?: string
         sessionId: string
         fenaPaymentId: string
         fenaReference: string
@@ -1817,6 +1962,7 @@ class FenaPaymentProviderService extends AbstractPaymentProvider<FenaPaymentProv
             await eventBus.emit({
                 name: "payment.fena_orphan_paid",
                 data: {
+                    cartId: args.cartId,
                     fenaPaymentId: args.fenaPaymentId,
                     fenaReference: args.fenaReference,
                     amount: args.amount,
